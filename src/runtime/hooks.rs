@@ -37,16 +37,12 @@ pub fn spawn(hooks: &HookCommands, kind: HookKind, priority: u8, group_id: u16) 
         ("VIPD_GROUP", group_id.to_string()),
     ];
     Some(tokio::spawn(async move {
-        match exec::run(&command, HOOK_TIMEOUT, &envs).await {
-            Ok(out) if out.success => {}
-            Ok(out) => tracing::warn!(
-                hook = state_name(kind),
-                code = ?out.code,
-                stderr = %out.stderr.trim(),
-                "hook failed"
-            ),
-            Err(err) => tracing::warn!(hook = state_name(kind), error = %err, "hook failed"),
-        }
+        let reason = match exec::run(&command, HOOK_TIMEOUT, &envs).await {
+            Ok(out) if out.success => return,
+            Ok(out) => out.failure(),
+            Err(err) => format!("{err:#}"),
+        };
+        tracing::warn!(hook = state_name(kind), %reason, "hook failed");
     }))
 }
 
