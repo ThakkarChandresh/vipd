@@ -24,6 +24,10 @@ impl ReplayGuard {
     }
 
     /// Returns true, and records the packet, if it is newer than anything accepted from `peer`.
+    ///
+    /// Preconditions (both guaranteed by the runtime): `interval` comes from a decoded heartbeat,
+    /// which `Codec::decode` limits to 50 ms – 60 s, and `peer` is one of the configured peers,
+    /// which keeps this map small.
     pub fn accept(&mut self, peer: Ipv4Addr, boot_id: u64, seq: u64, interval: Duration, now: Instant) -> bool {
         let fresh = match self.peers.get(&peer) {
             None => true,
@@ -87,5 +91,14 @@ mod tests {
         let t = Instant::now();
         assert!(guard.accept(PEER, 100, 5, SEC, t));
         assert!(guard.accept(Ipv4Addr::new(10, 0, 0, 9), 100, 1, SEC, t));
+    }
+
+    #[test]
+    fn an_earlier_now_does_not_count_as_silence() {
+        let mut guard = ReplayGuard::new();
+        let t = Instant::now() + SEC * 10;
+        assert!(guard.accept(PEER, 200, 9, SEC, t));
+        // `duration_since` saturates to zero, so going back in time never opens rule 4.
+        assert!(!guard.accept(PEER, 100, 1, SEC, t - SEC * 5));
     }
 }

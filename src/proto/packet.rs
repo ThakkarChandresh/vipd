@@ -12,6 +12,11 @@ const KIND_HEARTBEAT: u8 = 1;
 /// Bytes 0..32 are covered by the HMAC, which fills bytes 32..64.
 const SIGNED_LEN: usize = 32;
 
+/// The legal range of `interval_ms`: the same range `advert_interval_ms` must have in the config.
+/// Anything else would break the down timer and replay rule 4, so such packets are rejected.
+pub const MIN_INTERVAL_MS: u16 = 50;
+pub const MAX_INTERVAL_MS: u16 = 60_000;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,8 @@ pub enum DecodeError {
     Kind(u8),
     #[error("bad signature (do the auth_keys match?)")]
     Signature,
+    #[error("heartbeat interval {0} ms is outside 50..=60000")]
+    Interval(u16),
 }
 
 /// Signs and verifies packets with the shared `auth_key`.
@@ -85,10 +92,14 @@ impl Codec {
         let mut mac = self.mac.clone();
         mac.update(&buf[..SIGNED_LEN]);
         mac.verify_slice(&buf[SIGNED_LEN..]).map_err(|_| DecodeError::Signature)?;
+        let interval_ms = u16::from_be_bytes([buf[10], buf[11]]);
+        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&interval_ms) {
+            return Err(DecodeError::Interval(interval_ms));
+        }
         Ok(Heartbeat {
             group_id: u16::from_be_bytes([buf[6], buf[7]]),
             priority: buf[8],
-            interval_ms: u16::from_be_bytes([buf[10], buf[11]]),
+            interval_ms,
             vip_fingerprint: u32::from_be_bytes(buf[12..16].try_into().unwrap()),
             boot_id: u64::from_be_bytes(buf[16..24].try_into().unwrap()),
             seq: u64::from_be_bytes(buf[24..32].try_into().unwrap()),
@@ -152,6 +163,10 @@ mod tests {
         let mut packet = codec.encode(&sample());
         packet[4] = 2;
         assert_eq!(codec.decode(&packet), Err(DecodeError::Version(2)));
+        assert_eq!(codec.decode(&[0u8; 100]), Err(DecodeError::Length(100)));
+        let mut packet = codec.encode(&sample());
+        packet[5] = 9;
+        assert_eq!(codec.decode(&packet), Err(DecodeError::Kind(9)));
     }
 
     #[test]
@@ -160,5 +175,18 @@ mod tests {
         let b = (Ipv4Addr::new(10, 0, 0, 2), 32);
         assert_eq!(vip_fingerprint(&[a, b]), vip_fingerprint(&[b, a]));
         assert_ne!(vip_fingerprint(&[a]), vip_fingerprint(&[b]));
+    }
+
+    #[test]
+    fn intervals_outside_the_config_range_are_rejected() {
+        let codec = Codec::new(b"a-long-random-shared-secret");
+        for bad in [0, 49, 60_001, u16::MAX] {
+            let packet = codec.encode(&Heartbeat { interval_ms: bad, ..sample() });
+            assert_eq!(codec.decode(&packet), Err(DecodeError::Interval(bad)));
+        }
+        for good in [MIN_INTERVAL_MS, 1000, MAX_INTERVAL_MS] {
+            let packet = codec.encode(&Heartbeat { interval_ms: good, ..sample() });
+            assert_eq!(codec.decode(&packet).map(|hb| hb.interval_ms), Ok(good));
+        }
     }
 }
