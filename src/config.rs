@@ -30,6 +30,25 @@ pub struct HookCommands {
     pub on_stop: Option<Vec<String>>,
 }
 
+/// The shared heartbeat key. Its `Debug` output is redacted so the secret cannot end up in a log.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct AuthKey(String);
+
+impl std::ops::Deref for AuthKey {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub node_name: String,
@@ -37,7 +56,7 @@ pub struct Config {
     pub priority: u8,
     pub preempt: bool,
     pub advert_interval_ms: u16,
-    pub auth_key: String,
+    pub auth_key: AuthKey,
     pub bind: SocketAddrV4,
     pub peers: Vec<SocketAddrV4>,
     pub log_level: String,
@@ -94,7 +113,7 @@ struct RawConfig {
     preempt: bool,
     #[serde(default = "default_advert_interval_ms")]
     advert_interval_ms: u16,
-    auth_key: String,
+    auth_key: AuthKey,
     bind: SocketAddrV4,
     peers: Vec<SocketAddrV4>,
     #[serde(default = "default_log_level")]
@@ -177,8 +196,14 @@ impl RawConfig {
         if self.auth_key.chars().count() < 16 {
             problems.push("auth_key must be at least 16 characters".to_string());
         }
+        if self.auth_key.trim().len() != self.auth_key.len() {
+            problems.push("auth_key must not start or end with whitespace".to_string());
+        }
         if self.bind.ip().is_unspecified() {
             problems.push("bind must use this node's real IP, not 0.0.0.0".to_string());
+        }
+        if self.bind.port() == 0 {
+            problems.push("bind needs a real port, not 0 (peers send heartbeats to it)".to_string());
         }
         if self.peers.is_empty() {
             problems.push("peers must list at least one other node".to_string());
@@ -190,6 +215,9 @@ impl RawConfig {
             }
             if peer.ip() == self.bind.ip() {
                 problems.push(format!("peers must not contain this node's own IP {}", peer.ip()));
+            }
+            if peer.port() == 0 {
+                problems.push(format!("peer {peer} needs a real port, not 0"));
             }
         }
         if !LOG_LEVELS.contains(&self.log_level.as_str()) {
@@ -213,9 +241,14 @@ impl RawConfig {
             if !vip_ips.insert(v.ip) {
                 problems.push(format!("vip {} is listed more than once", v.ip));
             }
+            if v.ip.is_unspecified() || v.ip.is_loopback() || v.ip.is_multicast() || v.ip.is_broadcast() {
+                problems.push(format!("vip {} is not a usable unicast address", v.ip));
+            }
             // Start-up removes leftover VIPs, so a node address listed as a VIP would be deleted.
-            if v.ip == *self.bind.ip() || peer_ips.contains(&v.ip) {
-                problems.push(format!("vip {} must not be this node's bind address or a peer's address", v.ip));
+            if v.ip == *self.bind.ip() {
+                problems.push(format!("vip {} must not be this node's own bind address", v.ip));
+            } else if peer_ips.contains(&v.ip) {
+                problems.push(format!("vip {} must not be a peer's address", v.ip));
             }
             vips.push(Vip { ip: v.ip, prefix: v.prefix, interface: v.interface.clone() });
         }
@@ -407,10 +440,62 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
 
     #[test]
     fn a_vip_must_not_be_a_node_address() {
-        for ip in ["192.168.1.13", "192.168.1.14"] {
+        for (ip, expected) in [("192.168.1.13", "own bind address"), ("192.168.1.14", "a peer's address")] {
             let p = problems(&MINIMAL.replace(r#"ip = "192.168.1.200""#, &format!(r#"ip = "{ip}""#)));
-            assert!(p.iter().any(|m| m.contains("must not be this node's bind address")), "{ip}: {p:?}");
+            assert!(p.iter().any(|m| m.contains(expected)), "{ip}: {p:?}");
         }
+    }
+
+    #[test]
+    fn every_rule_names_the_bad_setting() {
+        let cases = [
+            ("group_id = 51", "group_id = 0", "group_id"),
+            ("priority = 150", "priority = 0", "priority"),
+            ("priority = 150", "priority = 150\nadvert_interval_ms = 49", "advert_interval_ms"),
+            ("priority = 150", "priority = 150\nadvert_interval_ms = 60001", "advert_interval_ms"),
+            ("priority = 150", "priority = 150\nlog_level = \"loud\"", "log_level"),
+            ("0123456789abcdef", "0123456789abcdef ", "whitespace"),
+            ("192.168.1.13:8458", "192.168.1.13:0", "bind needs a real port"),
+            ("192.168.1.14:8458", "192.168.1.14:0", "needs a real port"),
+            (r#"ip = "192.168.1.200""#, r#"ip = "127.0.0.1""#, "not a usable unicast address"),
+            (r#"ip = "192.168.1.200""#, r#"ip = "224.0.0.18""#, "not a usable unicast address"),
+            (r#"interface = "eth0""#, "interface = \"eth0\"\nprefix = 33", "prefix"),
+        ];
+        for (from, to, expected) in cases {
+            let p = problems(&MINIMAL.replace(from, to));
+            assert!(p.iter().any(|m| m.contains(expected)), "{to}: {p:?}");
+        }
+    }
+
+    #[test]
+    fn every_check_rule_names_the_bad_setting() {
+        let check = |extra: &str| format!("{MINIMAL}\n[[check]]\nname = \"web\"\ncommand = \"true\"\n{extra}\n");
+        let cases = [
+            ("interval_ms = 99", "interval_ms"),
+            ("timeout_ms = 3600001", "timeout_ms"),
+            ("fall = 0", "fall and rise"),
+            ("rise = 0", "fall and rise"),
+            ("weight = -254", "weight"),
+            ("[[check]]\nname = \"web\"\ncommand = \"true\"", "more than once"),
+        ];
+        for (extra, expected) in cases {
+            let p = problems(&check(extra));
+            assert!(p.iter().any(|m| m.contains(expected)), "{extra}: {p:?}");
+        }
+    }
+
+    #[test]
+    fn a_check_timeout_defaults_to_its_interval() {
+        let text = format!("{MINIMAL}\n[[check]]\nname = \"web\"\ncommand = \"true\"\ninterval_ms = 2500\n");
+        let c = Config::from_toml(&text).unwrap();
+        assert_eq!(c.checks[0].timeout, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn debug_output_hides_the_auth_key() {
+        let c = Config::from_toml(MINIMAL).unwrap();
+        assert_eq!(&*c.auth_key, "0123456789abcdef");
+        assert!(!format!("{c:?}").contains("0123456789abcdef"));
     }
 
     #[test]
@@ -431,10 +516,12 @@ weight = 300
     #[cfg(target_os = "linux")]
     #[test]
     fn rejects_interface_names_linux_would_reject() {
-        for bad in ["../../etc", "eth0:1", "a-very-long-name0", "Ethernet 2", ".."] {
-            let p = problems(&MINIMAL.replace(r#"interface = "eth0""#, &format!("interface = {bad:?}")));
+        let with = |name: &str| MINIMAL.replace(r#"interface = "eth0""#, &format!("interface = {name:?}"));
+        for bad in ["../../etc", "eth0:1", "sixteen-bytes-00", "Ethernet 2", ".."] {
+            let p = problems(&with(bad));
             assert!(p.iter().any(|m| m.contains("interface")), "{bad}: {p:?}");
         }
+        assert!(Config::from_toml(&with("fifteen-bytes00")).is_ok(), "15 bytes is the kernel's limit");
     }
 
     #[test]
