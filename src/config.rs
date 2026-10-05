@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use crate::checks::CheckSpec;
 use crate::exec;
+use crate::proto::{MAX_INTERVAL_MS, MIN_INTERVAL_MS};
 use crate::vip::{CommandOverrides, Vip};
 
 #[derive(Debug, thiserror::Error)]
@@ -167,8 +168,11 @@ impl RawConfig {
         if !(1..=254).contains(&self.priority) {
             problems.push(format!("priority must be between 1 and 254 (got {})", self.priority));
         }
-        if !(50..=60_000).contains(&self.advert_interval_ms) {
-            problems.push(format!("advert_interval_ms must be between 50 and 60000 (got {})", self.advert_interval_ms));
+        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.advert_interval_ms) {
+            problems.push(format!(
+                "advert_interval_ms must be between {MIN_INTERVAL_MS} and {MAX_INTERVAL_MS} (got {})",
+                self.advert_interval_ms
+            ));
         }
         if self.auth_key.chars().count() < 16 {
             problems.push("auth_key must be at least 16 characters".to_string());
@@ -203,6 +207,8 @@ impl RawConfig {
             }
             if v.interface.trim().is_empty() {
                 problems.push(format!("vip {}: interface must not be empty", v.ip));
+            } else if let Some(reason) = interface_name_problem(&v.interface) {
+                problems.push(format!("vip {}: interface {:?} {reason}", v.ip, v.interface));
             }
             if !vip_ips.insert(v.ip) {
                 problems.push(format!("vip {} is listed more than once", v.ip));
@@ -287,6 +293,25 @@ impl RawConfig {
             vip_commands,
         })
     }
+}
+
+/// Why Linux would reject `name` as a network interface name (the kernel's `dev_valid_name`). This
+/// also keeps names like `../x` out of the `/sys/class/net/{iface}` paths. Windows adapter names
+/// may contain spaces and other characters, so only Linux checks.
+#[cfg(target_os = "linux")]
+fn interface_name_problem(name: &str) -> Option<&'static str> {
+    if name.len() > 15 {
+        Some("is longer than 15 bytes")
+    } else if name == "." || name == ".." || name.contains(['/', ':', '\0']) || name.contains(char::is_whitespace) {
+        Some("is not a valid Linux interface name")
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn interface_name_problem(_name: &str) -> Option<&'static str> {
+    None
 }
 
 #[cfg(test)]
@@ -389,6 +414,15 @@ weight = 300
         let p = problems(&text);
         assert!(p.iter().any(|m| m.contains("unterminated quote")), "{p:?}");
         assert!(p.iter().any(|m| m.contains("weight")), "{p:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_interface_names_linux_would_reject() {
+        for bad in ["../../etc", "eth0:1", "a-very-long-name0", "Ethernet 2", ".."] {
+            let p = problems(&MINIMAL.replace(r#"interface = "eth0""#, &format!("interface = {bad:?}")));
+            assert!(p.iter().any(|m| m.contains("interface")), "{bad}: {p:?}");
+        }
     }
 
     #[test]
