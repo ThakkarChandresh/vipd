@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use vipd::cli::{Cli, Command};
-use vipd::config::Config;
+use vipd::config::{Config, ConfigError};
 use vipd::vip::{PlatformBackend, VipBackend};
 use vipd::{logging, runtime, service};
 
@@ -18,7 +18,11 @@ fn main() -> ExitCode {
 /// Loads the config, or prints why it is invalid and returns exit code 2.
 fn load(path: &Path) -> Result<Config, ExitCode> {
     Config::load(path).map_err(|err| {
-        eprintln!("{}: {err}", path.display());
+        match err {
+            // A read error already names the file.
+            ConfigError::Read { .. } => eprintln!("{err}"),
+            _ => eprintln!("{}: {err}", path.display()),
+        }
         ExitCode::from(2)
     })
 }
@@ -51,8 +55,13 @@ fn check_config(path: &Path) -> ExitCode {
     let problems: Vec<String> = tokio_runtime().block_on(async {
         let mut problems = Vec::new();
         for vip in &config.vips {
-            if !backend.interface_exists(&vip.interface).await.unwrap_or(false) {
-                problems.push(format!("vip {}: interface {:?} does not exist on this machine", vip.ip, vip.interface));
+            match backend.interface_exists(&vip.interface).await {
+                Ok(true) => {}
+                Ok(false) => problems
+                    .push(format!("vip {}: interface {:?} does not exist on this machine", vip.ip, vip.interface)),
+                Err(err) => {
+                    problems.push(format!("vip {}: cannot check interface {:?}: {err:#}", vip.ip, vip.interface))
+                }
             }
         }
         problems

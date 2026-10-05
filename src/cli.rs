@@ -15,12 +15,12 @@ pub struct Cli {
 pub enum Command {
     /// Run in the foreground until SIGTERM, SIGINT or Ctrl+C.
     Run {
-        #[arg(long, default_value_os_t = default_config_path())]
+        #[arg(long, value_name = "PATH", default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Validate the config file; exit code 0 means valid, 2 means invalid.
     CheckConfig {
-        #[arg(long, default_value_os_t = default_config_path())]
+        #[arg(long, value_name = "PATH", default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Manage the Windows service.
@@ -32,7 +32,7 @@ pub enum Command {
 pub enum ServiceCommand {
     /// Register vipd as an automatic-start Windows service.
     Install {
-        #[arg(long, default_value_os_t = default_config_path())]
+        #[arg(long, value_name = "PATH", default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Remove the Windows service.
@@ -40,7 +40,7 @@ pub enum ServiceCommand {
     /// Entry point for the Windows Service Control Manager.
     #[command(hide = true)]
     Run {
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         config: PathBuf,
     },
 }
