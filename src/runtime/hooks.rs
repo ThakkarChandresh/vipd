@@ -29,6 +29,8 @@ fn command_for(hooks: &HookCommands, kind: HookKind) -> Option<&Vec<String>> {
 }
 
 /// Starts the hook for `kind` in the background, if one is configured. Failures are only logged.
+/// Hooks are not serialized: after quick state changes two of them can run at once and finish in
+/// either order, so a hook should act on `VIPD_STATE` rather than on the order it was called in.
 pub fn spawn(hooks: &HookCommands, kind: HookKind, priority: u8, group_id: u16) -> Option<JoinHandle<()>> {
     let command = command_for(hooks, kind)?.clone();
     let envs = vec![
@@ -70,5 +72,17 @@ mod tests {
         spawn(&hooks, HookKind::Master, 150, 51).unwrap().await.unwrap();
         assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "MASTER 150 51");
         let _ = std::fs::remove_file(out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_or_missing_hook_is_only_logged() {
+        for command in [vec!["sh", "-c", "exit 7"], vec!["/nonexistent/vipd-hook"]] {
+            let hooks = HookCommands {
+                on_fault: Some(command.iter().map(|s| s.to_string()).collect()),
+                ..HookCommands::default()
+            };
+            spawn(&hooks, HookKind::Fault, 1, 1).unwrap().await.unwrap();
+        }
     }
 }

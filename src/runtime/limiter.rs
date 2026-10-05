@@ -40,5 +40,7 @@ mod tests {
         assert!(limiter.allow(peer, "wrong group", t));
         assert!(limiter.allow(Ipv4Addr::new(10, 0, 0, 2), "bad signature", t));
         assert!(limiter.allow(peer, "bad signature", t + Duration::from_secs(60)));
+        // A clock reading before the stored one counts as no time having passed.
+        assert!(!limiter.allow(peer, "bad signature", t));
     }
 }
