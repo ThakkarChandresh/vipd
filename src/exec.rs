@@ -68,7 +68,7 @@ pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) ->
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     // A separate process group lets a timeout kill everything the command started (`sh -c` children too).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     cmd.process_group(0);
     // The child inherits vipd's environment (checks and hooks need PATH); `envs` are added on top.
     for (key, value) in envs {
@@ -80,8 +80,8 @@ pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) ->
     // then kills anything the child started. Cancelling `run` itself also drops `group`.
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => {
-            group.finished = true;
             let out = result.with_context(|| format!("cannot wait for `{}`", args.join(" ")))?;
+            group.finished = true;
             Ok(Output {
                 success: out.status.success(),
                 code: out.status.code(),
@@ -93,8 +93,8 @@ pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) ->
     }
 }
 
-/// Kills a command's whole process group unless the command finished on its own.
-/// On Windows only the direct process is killed (a Job Object would be needed for the rest).
+/// Kills a command's whole process group unless the command finished on its own. A descendant that
+/// moves to a group or session of its own (`setsid`) still escapes.
 struct GroupGuard {
     pid: Option<u32>,
     finished: bool,
@@ -102,15 +102,24 @@ struct GroupGuard {
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
         if let (Some(pid), false) = (self.pid, self.finished) {
-            // SAFETY: kill(2) on the process group created for this command; errors are irrelevant.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+            kill_group(pid);
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn kill_group(pgid: u32) {
+    // SAFETY: kill(2) on the process group created for this command; errors are irrelevant.
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGKILL);
+    }
+}
+
+/// Windows has no process groups, so only the direct process is killed (by `kill_on_drop`); a Job
+/// Object would be needed for the rest.
+#[cfg(not(target_os = "linux"))]
+fn kill_group(_pgid: u32) {}
 
 /// Like [`run`], but a non-zero exit code is an error that includes the command's output.
 pub async fn run_ok(args: &[String], timeout: Duration) -> anyhow::Result<Output> {
