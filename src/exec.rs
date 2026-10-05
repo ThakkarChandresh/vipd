@@ -62,6 +62,16 @@ pub struct Output {
     pub stderr: String,
 }
 
+impl Output {
+    /// Describes a failed run: the exit code and what the command printed. netsh prints its errors
+    /// on stdout, so stdout is used when stderr is empty.
+    pub fn failure(&self) -> String {
+        let detail = if self.stderr.trim().is_empty() { self.stdout.trim() } else { self.stderr.trim() };
+        let code = self.code.map_or_else(|| "none (killed by a signal)".to_string(), |code| code.to_string());
+        format!("exit code {code}: {detail}")
+    }
+}
+
 /// Runs `args[0]` with the remaining arguments. The process is killed if it outlives `timeout`.
 pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) -> anyhow::Result<Output> {
     let (program, rest) = args.split_first().context("empty command")?;
@@ -125,10 +135,7 @@ fn kill_group(_pgid: u32) {}
 pub async fn run_ok(args: &[String], timeout: Duration) -> anyhow::Result<Output> {
     let out = run(args, timeout, &[]).await?;
     if !out.success {
-        // netsh prints its errors on stdout, so fall back to it.
-        let detail = if out.stderr.trim().is_empty() { out.stdout.trim() } else { out.stderr.trim() };
-        let code = out.code.map_or_else(|| "none (killed by a signal)".to_string(), |code| code.to_string());
-        bail!("`{}` failed with exit code {}: {}", args.join(" "), code, detail);
+        bail!("`{}` failed with {}", args.join(" "), out.failure());
     }
     Ok(out)
 }
@@ -225,5 +232,13 @@ mod tests {
         let err = run_ok(&strings(&["sh", "-c", "echo boom >&2; exit 1"]), Duration::from_secs(5)).await.unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
         assert!(err.to_string().contains("exit code 1:"), "{err}");
+    }
+
+    #[test]
+    fn a_failure_shows_the_exit_code_and_the_output() {
+        let out = Output { success: false, code: Some(7), stdout: "on stdout\n".into(), stderr: String::new() };
+        assert_eq!(out.failure(), "exit code 7: on stdout");
+        let out = Output { success: false, code: None, stdout: "ignored".into(), stderr: " on stderr\n".into() };
+        assert_eq!(out.failure(), "exit code none (killed by a signal): on stderr");
     }
 }

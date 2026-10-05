@@ -26,14 +26,15 @@ pub struct CheckResult {
 }
 
 /// Runs the check once. Exit code 0 passes; any other code, a timeout or a start failure fails.
+/// Each failure is logged at debug level with its reason; the runtime logs status changes.
 pub async fn run_once(spec: &CheckSpec) -> bool {
-    match exec::run(&spec.command, spec.timeout, &[]).await {
-        Ok(out) => out.success,
-        Err(err) => {
-            tracing::debug!(check = %spec.name, error = %err, "check did not complete");
-            false
-        }
-    }
+    let reason = match exec::run(&spec.command, spec.timeout, &[]).await {
+        Ok(out) if out.success => return true,
+        Ok(out) => out.failure(),
+        Err(err) => format!("{err:#}"),
+    };
+    tracing::debug!(check = %spec.name, %reason, "check failed");
+    false
 }
 
 /// Runs the check every `interval`, starting one interval from now, and reports each result.
@@ -88,5 +89,27 @@ mod tests {
         let first = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
         assert_eq!(first, CheckResult { index: 7, passed: true });
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_slow_run_is_not_followed_by_a_burst_of_catch_up_runs() {
+        // The first run takes about two intervals and later runs are instant. Missed ticks are
+        // skipped, so the third run waits for the next scheduled tick instead of starting at once.
+        let marker = std::env::temp_dir().join(format!("vipd-slow-check-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("[ -e {0} ] && exit 0; touch {0}; sleep 0.62", marker.display());
+        let mut slow = spec(&["sh", "-c", &script], 2000);
+        slow.interval = Duration::from_millis(300);
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = spawn_check_loop(0, slow, tx);
+        let mut arrivals = Vec::new();
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            arrivals.push(tokio::time::Instant::now());
+        }
+        handle.abort();
+        let _ = std::fs::remove_file(&marker);
+        let gap = arrivals[2] - arrivals[0];
+        assert!(gap >= Duration::from_millis(100), "missed ticks ran back to back: {gap:?}");
     }
 }
