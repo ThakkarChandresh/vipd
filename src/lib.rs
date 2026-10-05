@@ -4,3 +4,4 @@ pub mod checks;
 pub mod election;
 pub mod exec;
 pub mod proto;
+pub mod vip;
