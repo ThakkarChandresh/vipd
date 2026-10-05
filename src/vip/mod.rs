@@ -22,9 +22,10 @@ pub struct Vip {
 }
 
 impl Vip {
-    /// The dotted netmask for `prefix`, e.g. 24 → 255.255.255.0.
+    /// The dotted netmask for `prefix`, e.g. 24 → 255.255.255.0. Config validation keeps `prefix`
+    /// within 1..=32; anything larger is treated as 32.
     pub fn mask(&self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::MAX.checked_shl(32 - u32::from(self.prefix)).unwrap_or(0))
+        Ipv4Addr::from(u32::MAX.checked_shl(32u32.saturating_sub(u32::from(self.prefix))).unwrap_or(0))
     }
 
     /// Values for the `{ip}`, `{prefix}`, `{mask}` and `{iface}` placeholders.
@@ -126,6 +127,10 @@ mod tests {
         assert_eq!(v.mask(), Ipv4Addr::new(255, 255, 255, 255));
         v.prefix = 1;
         assert_eq!(v.mask(), Ipv4Addr::new(128, 0, 0, 0));
+        v.prefix = 0;
+        assert_eq!(v.mask(), Ipv4Addr::new(0, 0, 0, 0));
+        v.prefix = 33;
+        assert_eq!(v.mask(), Ipv4Addr::new(255, 255, 255, 255));
     }
 
     #[tokio::test]
@@ -137,6 +142,15 @@ mod tests {
         assert!(manager.ensure_detached(&vip()).await.unwrap());
         assert!(!manager.ensure_detached(&vip()).await.unwrap());
         assert_eq!(fake.calls(), vec!["attach 10.0.0.200", "detach 10.0.0.200"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_attach_is_an_error_and_leaves_the_vip_detached() {
+        let fake = FakeBackend::new();
+        fake.set_fail_attach(true);
+        let manager = VipManager::new(fake.clone(), CommandOverrides::default());
+        assert!(manager.ensure_attached(&vip()).await.is_err());
+        assert!(!fake.is_attached(vip().ip));
     }
 
     #[cfg(unix)]
