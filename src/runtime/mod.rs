@@ -38,8 +38,15 @@ pub async fn run<B: VipBackend>(
     let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     let manager = Arc::new(VipManager::new(backend, cfg.vip_commands.clone()));
 
+    // Nothing is held yet, so a stop while the interfaces are checked just stops. Polling `shutdown`
+    // here also installs its signal handlers before the slower steps.
+    tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        checked = check_interfaces(&cfg, &manager) => checked?,
+    }
     // Leftover VIPs are always removed, even if a stop arrives meanwhile: the peer may already hold
-    // them. Watching `shutdown` here also installs its signal handlers before the slower steps.
+    // them.
     let mut stopping = false;
     {
         let cleanup = remove_leftover_vips(&cfg, &manager);
@@ -168,14 +175,18 @@ pub async fn run<B: VipBackend>(
     flushed
 }
 
-/// Start-up before the election (spec §11.1): every VIP's interface must exist, and VIPs left over
-/// from a crash are removed, so a node never starts out holding one.
-async fn remove_leftover_vips<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<()> {
+/// Every VIP's interface must exist before the election starts (spec §10).
+async fn check_interfaces<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<()> {
     for vip in &cfg.vips {
         if !manager.interface_exists(&vip.interface).await? {
             anyhow::bail!("network interface {:?} (for VIP {}) does not exist", vip.interface, vip.ip);
         }
     }
+    Ok(())
+}
+
+/// Removes VIPs left over from a crash, so a node never starts out holding one (spec §11.1).
+async fn remove_leftover_vips<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<()> {
     for vip in &cfg.vips {
         manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip))?;
     }

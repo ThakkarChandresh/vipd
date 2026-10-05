@@ -33,8 +33,12 @@ impl ReplayGuard {
     /// Within the newest run of a peer (its highest `boot_id`), and within the last run accepted,
     /// only a higher `seq` is accepted, however long the peer has been silent. Any other, older
     /// `boot_id` is accepted after three silent intervals: a peer restarted with its clock set
-    /// back. The limit that remains: packets captured from three runs of a peer let the two older
-    /// runs be replayed in turn while the peer is silent.
+    /// back.
+    ///
+    /// Known limit: once one packet of an older run is accepted, the rest of that run is too, and
+    /// a freshly started node accepts any run. So whoever captured a stretch of a peer's
+    /// heartbeats can replay it while that peer is silent, and keep this node from becoming master
+    /// for as long as the capture lasts. Closing this needs a boot counter that survives restarts.
     ///
     /// Preconditions (both guaranteed by the runtime): `interval` comes from a decoded heartbeat,
     /// which `Codec::decode` limits to 50 ms – 60 s, and `peer` is one of the configured peers,
