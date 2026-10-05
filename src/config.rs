@@ -213,6 +213,10 @@ impl RawConfig {
             if !vip_ips.insert(v.ip) {
                 problems.push(format!("vip {} is listed more than once", v.ip));
             }
+            // Start-up removes leftover VIPs, so a node address listed as a VIP would be deleted.
+            if v.ip == *self.bind.ip() || peer_ips.contains(&v.ip) {
+                problems.push(format!("vip {} must not be this node's bind address or a peer's address", v.ip));
+            }
             vips.push(Vip { ip: v.ip, prefix: v.prefix, interface: v.interface.clone() });
         }
 
@@ -399,6 +403,14 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
         let p = problems(&text);
         assert!(p.iter().any(|m| m.contains("own IP")), "{p:?}");
         assert!(p.iter().any(|m| m.contains("more than once")), "{p:?}");
+    }
+
+    #[test]
+    fn a_vip_must_not_be_a_node_address() {
+        for ip in ["192.168.1.13", "192.168.1.14"] {
+            let p = problems(&MINIMAL.replace(r#"ip = "192.168.1.200""#, &format!(r#"ip = "{ip}""#)));
+            assert!(p.iter().any(|m| m.contains("must not be this node's bind address")), "{ip}: {p:?}");
+        }
     }
 
     #[test]
