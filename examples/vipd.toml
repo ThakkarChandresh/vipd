@@ -13,7 +13,7 @@ peers = ["192.168.1.14:8458"]       # every other node
 
 [[vip]]
 ip = "192.168.1.200"
-prefix = 24                         # defaults to 32
+prefix = 32                         # the default; see "VIP prefix" in the README before using /24
 interface = "eth0"                  # on Windows the adapter name, e.g. "Ethernet"
 
 [[check]]
