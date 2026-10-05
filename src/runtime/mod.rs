@@ -38,16 +38,18 @@ pub async fn run<B: VipBackend>(
     let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     let manager = Arc::new(VipManager::new(backend, cfg.vip_commands.clone()));
 
-    // Nothing is held yet, so a stop while the interfaces are checked just stops. Polling `shutdown`
-    // here also installs its signal handlers before the slower steps.
-    tokio::select! {
+    // A stop cuts the interface check short; leftover VIPs are still removed below. Polling
+    // `shutdown` here also installs its signal handlers before the slower steps.
+    let mut stopping = tokio::select! {
         biased;
-        () = &mut shutdown => return Ok(()),
-        checked = check_interfaces(&cfg, &manager) => checked?,
-    }
+        () = &mut shutdown => true,
+        checked = check_interfaces(&cfg, &manager) => {
+            checked?;
+            false
+        }
+    };
     // Leftover VIPs are always removed, even if a stop arrives meanwhile: the peer may already hold
     // them.
-    let mut stopping = false;
     {
         let cleanup = remove_leftover_vips(&cfg, &manager);
         tokio::pin!(cleanup);

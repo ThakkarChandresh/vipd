@@ -213,7 +213,12 @@ async fn a_stop_during_start_up_still_removes_a_leftover_vip() {
     let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 81), Ipv4Addr::new(127, 0, 0, 82)]);
     let cfg = config(addrs[0], &[addrs[1]], 100);
     let fake = FakeBackend::new();
+    // A stop that has already happened...
     fake.attach(&cfg.vips[0]).await.unwrap(); // left over from a crash
+    runtime::run(cfg.clone(), fake.clone(), async {}).await.unwrap();
+    assert!(!fake.is_attached(VIP), "an immediate stop still removes the leftover VIP");
+    // ...and one that comes during a slow detach.
+    fake.attach(&cfg.vips[0]).await.unwrap();
     fake.set_detach_delay(Duration::from_millis(300));
     runtime::run(cfg, fake.clone(), tokio::time::sleep(Duration::from_millis(50))).await.unwrap();
     assert!(!fake.is_attached(VIP), "the cleanup finished before run returned");
