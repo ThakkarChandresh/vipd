@@ -3,3 +3,4 @@
 
 mod hooks;
 mod limiter;
+mod vip_worker;
