@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -77,6 +78,9 @@ fn install(config: &Path) -> anyhow::Result<()> {
         command: None,
         actions: Some(vec![ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(5) }]),
     })?;
+    // Restart after an error exit too, not only after a crash: vipd exits with an error when start-up
+    // fails or its VIP worker dies, and start-up cleanup then removes any leftover VIP.
+    service.set_failure_actions_on_non_crash_failures(true)?;
     println!("Installed the vipd service. Start it with: sc start vipd");
     Ok(())
 }
@@ -96,9 +100,8 @@ fn uninstall() -> anyhow::Result<()> {
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
-    if let Err(err) = run_service() {
-        tracing::error!(error = %format!("{err:#}"), "the vipd service failed");
-    }
+    // run_service logs its own errors, while its log file is still open.
+    let _ = run_service();
 }
 
 fn run_service() -> anyhow::Result<()> {
@@ -113,7 +116,7 @@ fn run_service() -> anyhow::Result<()> {
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
     })?;
-    let set_state = |state: ServiceState, exit_code: u32| {
+    let set_state = move |state: ServiceState, exit_code: u32, wait_hint: Duration| {
         status.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
             current_state: state,
@@ -124,21 +127,46 @@ fn run_service() -> anyhow::Result<()> {
             },
             exit_code: ServiceExitCode::Win32(exit_code),
             checkpoint: 0,
-            wait_hint: Duration::default(),
+            wait_hint,
             process_id: None,
         })
     };
 
+    // Log to the configured directory, or to the default one when the config cannot be loaded, so
+    // that error is recorded too.
+    let config = Config::load(&config_path);
+    let (log_dir, log_level) = match &config {
+        Ok(config) => (config.log_dir.clone().unwrap_or_else(default_log_dir), config.log_level.clone()),
+        Err(_) => (default_log_dir(), "info".to_string()),
+    };
+    let _log_guard = logging::init_file(&log_dir, &log_level);
+    let stop_requested = Arc::new(AtomicBool::new(false));
     let result = (|| -> anyhow::Result<()> {
-        let config = Config::load(&config_path)?;
-        let log_dir = config.log_dir.clone().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\vipd"));
-        let _log_guard = logging::init_file(&log_dir, &config.log_level)?;
-        set_state(ServiceState::Running, 0)?;
+        let config = config?;
+        set_state(ServiceState::Running, 0, Duration::ZERO)?;
         tracing::info!(config = %config_path.display(), "vipd service started");
+        let shutdown = {
+            let stop_requested = stop_requested.clone();
+            async move {
+                stop.notified().await;
+                stop_requested.store(true, Ordering::SeqCst);
+                // Up to 15 s for the VIPs and 5 s for on_stop (spec §11.4).
+                let _ = set_state(ServiceState::StopPending, 0, Duration::from_secs(25));
+            }
+        };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        rt.block_on(runtime::run(config, PlatformBackend::new(), async move { stop.notified().await }))
+        rt.block_on(runtime::run(config, PlatformBackend::new(), shutdown))
     })();
-
-    set_state(ServiceState::Stopped, if result.is_ok() { 0 } else { 1 })?;
+    if let Err(err) = &result {
+        tracing::error!(error = %format!("{err:#}"), "the vipd service failed");
+    }
+    // A stop the operator asked for is not a failure, even if a VIP could not be removed: with
+    // restart-on-failure the SCM would otherwise start the service it was just told to stop.
+    let exit_code = if result.is_ok() || stop_requested.load(Ordering::SeqCst) { 0 } else { 1 };
+    set_state(ServiceState::Stopped, exit_code, Duration::ZERO)?;
     result
+}
+
+fn default_log_dir() -> PathBuf {
+    PathBuf::from(r"C:\ProgramData\vipd")
 }
