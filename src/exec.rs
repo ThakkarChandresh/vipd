@@ -46,7 +46,8 @@ pub fn tokenize(template: &str) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
-/// Replaces `{name}` placeholders inside each argument.
+/// Replaces `{name}` placeholders inside each argument. Values are substituted one name at a time,
+/// so a value must not itself contain another placeholder (vipd's values never do).
 pub fn substitute(args: &[String], vars: &[(&str, String)]) -> Vec<String> {
     args.iter()
         .map(|arg| vars.iter().fold(arg.clone(), |acc, (name, value)| acc.replace(&format!("{{{name}}}"), value)))
@@ -66,13 +67,20 @@ pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) ->
     let (program, rest) = args.split_first().context("empty command")?;
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // A separate process group lets a timeout kill everything the command started (`sh -c` children too).
+    #[cfg(unix)]
+    cmd.process_group(0);
+    // The child inherits vipd's environment (checks and hooks need PATH); `envs` are added on top.
     for (key, value) in envs {
         cmd.env(key, value);
     }
     let child = cmd.spawn().with_context(|| format!("cannot start `{}`", args.join(" ")))?;
-    // On timeout the `wait_with_output` future is dropped, which drops (and kills) the child.
+    let mut group = GroupGuard { pid: child.id(), finished: false };
+    // On timeout the `wait_with_output` future is dropped, which drops (and kills) the child; `group`
+    // then kills anything the child started. Cancelling `run` itself also drops `group`.
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => {
+            group.finished = true;
             let out = result.with_context(|| format!("cannot wait for `{}`", args.join(" ")))?;
             Ok(Output {
                 success: out.status.success(),
@@ -85,13 +93,33 @@ pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) ->
     }
 }
 
+/// Kills a command's whole process group unless the command finished on its own.
+/// On Windows only the direct process is killed (a Job Object would be needed for the rest).
+struct GroupGuard {
+    pid: Option<u32>,
+    finished: bool,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let (Some(pid), false) = (self.pid, self.finished) {
+            // SAFETY: kill(2) on the process group created for this command; errors are irrelevant.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Like [`run`], but a non-zero exit code is an error that includes the command's output.
 pub async fn run_ok(args: &[String], timeout: Duration) -> anyhow::Result<Output> {
     let out = run(args, timeout, &[]).await?;
     if !out.success {
         // netsh prints its errors on stdout, so fall back to it.
         let detail = if out.stderr.trim().is_empty() { out.stdout.trim() } else { out.stderr.trim() };
-        bail!("`{}` failed with exit code {:?}: {}", args.join(" "), out.code, detail);
+        let code = out.code.map_or_else(|| "none (killed by a signal)".to_string(), |code| code.to_string());
+        bail!("`{}` failed with exit code {}: {}", args.join(" "), code, detail);
     }
     Ok(out)
 }
@@ -161,10 +189,32 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timeout_kills_everything_the_command_started() {
+        let pidfile = std::env::temp_dir().join(format!("vipd-exec-group-{}.pid", std::process::id()));
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let err = run(&strings(&["sh", "-c", &script]), Duration::from_millis(300), &[]).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+        let _ = std::fs::remove_file(&pidfile);
+        // The background `sleep` must be gone (or a zombie about to be reaped), not still running.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| !stat.contains(") Z "));
+            if !running {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "background sleep {pid} survived the timeout");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_ok_turns_a_failure_into_an_error() {
         let err = run_ok(&strings(&["sh", "-c", "echo boom >&2; exit 1"]), Duration::from_secs(5)).await.unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
+        assert!(err.to_string().contains("exit code 1:"), "{err}");
     }
 }
