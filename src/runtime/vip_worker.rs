@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::vip::{Vip, VipBackend, VipManager};
 
@@ -16,7 +17,8 @@ pub enum VipRequest {
     Attach,
     Detach,
     Announce,
-    /// Answered once every earlier request has been processed.
+    /// Answered once every earlier request has been processed and no failed detach is still being
+    /// retried, so a shutdown that waits for it also waits for the retries.
     Flush(oneshot::Sender<()>),
 }
 
@@ -31,6 +33,9 @@ enum Desired {
     Detached,
 }
 
+/// Starts the worker. Requests are applied strictly in order; a failed detach is retried every
+/// 2 s until it succeeds or an attach replaces it. The worker stops when every request sender is
+/// dropped, and `events` closes when it stops, so a caller can treat that as the worker dying.
 pub fn spawn<B: VipBackend>(
     manager: Arc<VipManager<B>>,
     vips: Vec<Vip>,
@@ -39,45 +44,57 @@ pub fn spawn<B: VipBackend>(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
         let mut desired = Desired::Detached;
-        let mut detach_pending = false;
+        // When the failed detach is tried again. New requests do not move it.
+        let mut retry_at: Option<Instant> = None;
+        let mut flushes = Vec::new();
         loop {
-            let request = if detach_pending {
-                match tokio::time::timeout(DETACH_RETRY, rx.recv()).await {
-                    Ok(Some(request)) => Some(request),
-                    Ok(None) => break,
-                    Err(_) => None, // time to retry the failed detach
-                }
-            } else {
-                match rx.recv().await {
+            let request = tokio::select! {
+                request = rx.recv() => match request {
                     Some(request) => Some(request),
                     None => break,
-                }
+                },
+                () = sleep_until(retry_at) => None,
             };
             match request {
-                None => detach_pending = !detach_all(&manager, &vips).await,
+                None => retry_at = retry_after(detach_all(&manager, &vips).await),
                 Some(VipRequest::Attach) => {
                     desired = Desired::Attached;
-                    detach_pending = false;
+                    retry_at = None;
                     if !attach_all(&manager, &vips).await {
                         let _ = events.send(WorkerEvent::AttachFailed);
                     }
                 }
                 Some(VipRequest::Detach) => {
                     desired = Desired::Detached;
-                    detach_pending = !detach_all(&manager, &vips).await;
+                    retry_at = retry_after(detach_all(&manager, &vips).await);
                 }
                 Some(VipRequest::Announce) => {
                     if desired == Desired::Attached {
                         announce_all(&manager, &vips).await;
                     }
                 }
-                Some(VipRequest::Flush(done)) => {
+                Some(VipRequest::Flush(done)) => flushes.push(done),
+            }
+            if retry_at.is_none() {
+                for done in flushes.drain(..) {
                     let _ = done.send(());
                 }
             }
         }
     });
     (tx, handle)
+}
+
+/// `None` if the detach succeeded, otherwise when to try it again.
+fn retry_after(detached: bool) -> Option<Instant> {
+    (!detached).then(|| Instant::now() + DETACH_RETRY)
+}
+
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn attach_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> bool {
@@ -156,6 +173,39 @@ mod tests {
             vec!["attach 10.0.0.200", "announce 10.0.0.200", "announce 10.0.0.200", "detach 10.0.0.200"]
         );
         assert!(!fake.is_attached(VIP_IP));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_detach_is_retried_and_holds_back_flush() {
+        let (fake, tx, _events) = setup();
+        tx.send(VipRequest::Attach).unwrap();
+        flush(&tx).await;
+        fake.set_fail_detach(true);
+        tx.send(VipRequest::Detach).unwrap();
+        let (done, mut flushed) = oneshot::channel();
+        tx.send(VipRequest::Flush(done)).unwrap();
+        tx.send(VipRequest::Announce).unwrap(); // does not postpone the retry
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert!(flushed.try_recv().is_err(), "flush waits while the detach is retried");
+        let detaches = fake.calls().iter().filter(|c| c.starts_with("detach")).count();
+        assert_eq!(detaches, 3, "the first attempt plus retries at 2 s and 4 s");
+        fake.set_fail_detach(false);
+        flushed.await.unwrap();
+        assert!(!fake.is_attached(VIP_IP));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attach_cancels_a_pending_detach_retry() {
+        let (fake, tx, _events) = setup();
+        tx.send(VipRequest::Attach).unwrap();
+        flush(&tx).await;
+        fake.set_fail_detach(true);
+        tx.send(VipRequest::Detach).unwrap();
+        tx.send(VipRequest::Attach).unwrap();
+        flush(&tx).await; // answered at once: nothing is pending any more
+        fake.set_fail_detach(false);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(fake.is_attached(VIP_IP), "no retry ran after the attach");
     }
 
     #[tokio::test]

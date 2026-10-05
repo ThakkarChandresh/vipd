@@ -23,3 +23,6 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2"
 windows-service = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["test-util"] }

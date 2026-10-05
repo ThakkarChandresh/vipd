@@ -18,6 +18,7 @@ struct Inner {
     attached: Mutex<BTreeSet<Ipv4Addr>>,
     calls: Mutex<Vec<String>>,
     fail_attach: AtomicBool,
+    fail_detach: AtomicBool,
 }
 
 impl FakeBackend {
@@ -36,6 +37,10 @@ impl FakeBackend {
 
     pub fn set_fail_attach(&self, fail: bool) {
         self.inner.fail_attach.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_fail_detach(&self, fail: bool) {
+        self.inner.fail_detach.store(fail, Ordering::SeqCst);
     }
 
     fn record(&self, call: String) {
@@ -63,6 +68,9 @@ impl VipBackend for FakeBackend {
 
     async fn detach(&self, vip: &Vip, _found: &str) -> anyhow::Result<()> {
         self.record(format!("detach {}", vip.ip));
+        if self.inner.fail_detach.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated detach failure");
+        }
         self.inner.attached.lock().unwrap().remove(&vip.ip);
         Ok(())
     }
