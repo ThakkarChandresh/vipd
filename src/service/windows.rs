@@ -108,19 +108,28 @@ fn uninstall() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager
         .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)?;
-    if service.query_status()?.current_state == ServiceState::Running {
-        service.stop()?;
-    }
-    // Wait up to a minute for it to stop, so an install right after this does not find the old
-    // service still "marked for deletion".
+    // Stop it, waiting up to a minute, so an install right after this does not find the old service
+    // still "marked for deletion". A service that is still starting is stopped once it runs.
+    let mut stopped = false;
     for _ in 0..120 {
-        if service.query_status()?.current_state == ServiceState::Stopped {
-            break;
+        match service.query_status()?.current_state {
+            ServiceState::Stopped => {
+                stopped = true;
+                break;
+            }
+            ServiceState::Running => {
+                let _ = service.stop();
+            }
+            _ => {}
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     service.delete()?;
-    println!("Removed the vipd service.");
+    if stopped {
+        println!("Removed the vipd service.");
+    } else {
+        println!("Marked the vipd service for deletion; Windows removes it once it has stopped.");
+    }
     Ok(())
 }
 
@@ -151,7 +160,7 @@ fn run_service() {
     let Ok(status) = service_control_handler::register(SERVICE_NAME, handler) else {
         return;
     };
-    let set_state = move |state: ServiceState, exit_code: u32, wait_hint: Duration| {
+    let set_state = move |state: ServiceState, code: u32, wait_hint: Duration| {
         status.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
             current_state: state,
@@ -160,7 +169,7 @@ fn run_service() {
             } else {
                 ServiceControlAccept::empty()
             },
-            exit_code: match exit_code {
+            exit_code: match code {
                 0 => ServiceExitCode::Win32(0),
                 code => ServiceExitCode::ServiceSpecific(code),
             },
@@ -179,7 +188,11 @@ fn run_service() {
     };
     if let Err(err) = logging::init_file(&log_dir, &log_level) {
         let _ = logging::init_file(&default_log_dir(), &log_level);
-        tracing::error!(dir = %log_dir.display(), error = %format!("{err:#}"), "cannot log to log_dir; using the default");
+        tracing::error!(
+            dir = %log_dir.display(),
+            error = %format!("{err:#}"),
+            "cannot log to log_dir; using the default"
+        );
     }
 
     let result = (|| -> anyhow::Result<()> {
@@ -200,6 +213,7 @@ fn run_service() {
     let _ = set_state(ServiceState::Stopped, exit_code(&result, stop_requested.load(Ordering::SeqCst)), Duration::ZERO);
 }
 
+/// A directory of its own, because the 14-file limit prunes every `vipd*.log` file in it.
 fn default_log_dir() -> PathBuf {
-    PathBuf::from(r"C:\ProgramData\vipd")
+    PathBuf::from(r"C:\ProgramData\vipd\logs")
 }
