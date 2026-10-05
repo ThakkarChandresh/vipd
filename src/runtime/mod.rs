@@ -27,54 +27,46 @@ const WORKER_FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 const WARN_WINDOW: Duration = Duration::from_secs(60);
 
-/// Runs one node until `shutdown` completes. Returns an error only if start-up fails.
+/// Runs one node until `shutdown` completes. Returns an error if start-up fails, if the VIP worker
+/// dies, or if a VIP may still be attached when it stops.
 pub async fn run<B: VipBackend>(
     cfg: Config,
     backend: B,
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
+    tokio::pin!(shutdown);
     let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     let manager = Arc::new(VipManager::new(backend, cfg.vip_commands.clone()));
 
-    for vip in &cfg.vips {
-        if !manager.interface_exists(&vip.interface).await? {
-            anyhow::bail!("network interface {:?} (for VIP {}) does not exist", vip.interface, vip.ip);
-        }
-    }
-    // Clean up after a crash: never start out holding a VIP (spec §11.1 step 3).
-    for vip in &cfg.vips {
-        manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip))?;
-    }
-
-    // First round of checks, all at once, before the election starts.
-    let mut check_states: Vec<CheckState> = cfg.checks.iter().map(|c| CheckState::new(c.fall, c.rise)).collect();
-    let mut first_round = JoinSet::new();
-    for (index, spec) in cfg.checks.iter().cloned().enumerate() {
-        first_round.spawn(async move { (index, checks::run_once(&spec).await) });
-    }
-    while let Some(joined) = first_round.join_next().await {
-        let (index, passed) = joined.context("a health check task panicked")?;
-        check_states[index].record(passed);
-    }
+    // A stop during start-up just stops: nothing is held yet. Polling `shutdown` this early also
+    // installs its signal handlers before the slower start-up steps run.
+    let mut check_states = tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        prepared = prepare(&cfg, &manager) => prepared?,
+    };
     let mut health = current_health(&cfg, &check_states);
 
     let (worker_events_tx, mut worker_events) = mpsc::unbounded_channel();
     let (vip_tx, _worker) = vip_worker::spawn(manager, cfg.vips.clone(), worker_events_tx);
 
     let (check_tx, mut check_results) = mpsc::channel(64);
-    let check_loops: Vec<JoinHandle<()>> = cfg
-        .checks
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, spec)| checks::spawn_check_loop(index, spec, check_tx.clone()))
-        .collect();
+    let check_loops = CheckLoops(
+        cfg.checks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, spec)| checks::spawn_check_loop(index, spec, check_tx.clone()))
+            .collect(),
+    );
     drop(check_tx);
 
     let mut node = Node::new(&cfg, socket, vip_tx);
     let mut machine = Machine::new(MachineConfig::new(cfg.preempt, cfg.advert_interval(), *cfg.bind.ip()));
     tracing::info!(
         node = %cfg.node_name,
+        bind = %cfg.bind,
+        peers = cfg.peers.len(),
         priority = health.effective_priority,
         fault = health.fault,
         "starting election"
@@ -82,7 +74,6 @@ pub async fn run<B: VipBackend>(
     let actions = machine.handle(Event::Started { health }, Instant::now());
     node.execute(&machine, actions).await;
 
-    tokio::pin!(shutdown);
     let mut buf = [0u8; 2 * PACKET_LEN];
     loop {
         let deadline = machine.next_deadline();
@@ -91,7 +82,7 @@ pub async fn run<B: VipBackend>(
             received = node.socket.recv_from(&mut buf) => match received {
                 Ok((len, from)) => node.heartbeat_event(&buf[..len], from),
                 Err(err) => {
-                    tracing::warn!(error = %err, "receiving a heartbeat failed");
+                    node.receive_failed(&err);
                     None
                 }
             },
@@ -107,6 +98,11 @@ pub async fn run<B: VipBackend>(
                 if new_health == health {
                     None
                 } else {
+                    tracing::info!(
+                        priority = new_health.effective_priority,
+                        fault = new_health.fault,
+                        "health changed"
+                    );
                     health = new_health;
                     Some(Event::HealthChanged(health))
                 }
@@ -127,6 +123,7 @@ pub async fn run<B: VipBackend>(
                     from = ?before,
                     to = ?machine.state(),
                     priority = machine.health().effective_priority,
+                    cause = ?event,
                     "state changed"
                 );
             }
@@ -135,17 +132,10 @@ pub async fn run<B: VipBackend>(
     }
 
     tracing::info!("shutting down");
-    for handle in check_loops {
-        handle.abort();
-    }
+    drop(check_loops);
     let actions = machine.handle(Event::Shutdown, Instant::now());
     node.execute(&machine, actions).await;
-    let (done, flushed) = oneshot::channel();
-    if node.vip_tx.send(VipRequest::Flush(done)).is_ok()
-        && tokio::time::timeout(WORKER_FLUSH_TIMEOUT, flushed).await.is_err()
-    {
-        tracing::warn!("timed out waiting for the VIPs to be removed");
-    }
+    let flushed = flush_worker(&node.vip_tx).await;
     if let Some(stop_hook) = node.stop_hook.take() {
         if tokio::time::timeout(STOP_HOOK_TIMEOUT, stop_hook).await.is_err() {
             tracing::warn!("on_stop is still running after 5 s; it is stopped as vipd exits");
@@ -153,7 +143,57 @@ pub async fn run<B: VipBackend>(
     }
     // Returning lets the runtime drop every task that is still running, and dropping a command's
     // future kills its whole process group (hooks included). std::process::exit would skip that.
-    Ok(())
+    flushed
+}
+
+/// Start-up before the election (spec §11.1): every VIP's interface must exist, leftover VIPs are
+/// removed, and the first round of checks runs, all checks at once.
+async fn prepare<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<Vec<CheckState>> {
+    for vip in &cfg.vips {
+        if !manager.interface_exists(&vip.interface).await? {
+            anyhow::bail!("network interface {:?} (for VIP {}) does not exist", vip.interface, vip.ip);
+        }
+    }
+    // Clean up after a crash: never start out holding a VIP (spec §11.1 step 3).
+    for vip in &cfg.vips {
+        manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip))?;
+    }
+    let mut check_states: Vec<CheckState> = cfg.checks.iter().map(|c| CheckState::new(c.fall, c.rise)).collect();
+    let mut first_round = JoinSet::new();
+    for (index, spec) in cfg.checks.iter().cloned().enumerate() {
+        first_round.spawn(async move { (index, checks::run_once(&spec).await) });
+    }
+    while let Some(joined) = first_round.join_next().await {
+        let (index, passed) = joined.context("a health check task panicked")?;
+        check_states[index].record(passed);
+    }
+    Ok(check_states)
+}
+
+/// Waits up to 15 s for the VIP worker to finish every request, retries of a failed detach
+/// included. An error means a VIP may still be attached.
+async fn flush_worker(vip_tx: &mpsc::UnboundedSender<VipRequest>) -> anyhow::Result<()> {
+    let (done, flushed) = oneshot::channel();
+    anyhow::ensure!(
+        vip_tx.send(VipRequest::Flush(done)).is_ok(),
+        "the VIP worker had stopped, so a VIP may still be attached"
+    );
+    match tokio::time::timeout(WORKER_FLUSH_TIMEOUT, flushed).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => anyhow::bail!("the VIP worker stopped before the VIPs were removed"),
+        Err(_) => anyhow::bail!("the VIPs were still not removed after 15 s"),
+    }
+}
+
+/// The health-check loops. Dropping this aborts them, so no way out of `run` leaves them running.
+struct CheckLoops(Vec<JoinHandle<()>>);
+
+impl Drop for CheckLoops {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 fn current_health(cfg: &Config, states: &[CheckState]) -> Health {
@@ -252,6 +292,16 @@ impl Node {
         }
     }
 
+    /// Windows reports an earlier heartbeat's ICMP "port unreachable" (a stopped peer) as a reset
+    /// on the next receive, so that one is expected. Anything else is warned about once a minute.
+    fn receive_failed(&mut self, err: &std::io::Error) {
+        if err.kind() == std::io::ErrorKind::ConnectionReset {
+            tracing::debug!(error = %err, "a peer's heartbeat port was unreachable");
+        } else if self.warnings.allow(Ipv4Addr::UNSPECIFIED, "receive failed", Instant::now()) {
+            tracing::warn!(error = %err, "receiving a heartbeat failed");
+        }
+    }
+
     async fn execute(&mut self, machine: &Machine, actions: Vec<Action>) {
         let effective = machine.health().effective_priority;
         for action in actions {
@@ -286,9 +336,12 @@ impl Node {
             boot_id: self.boot_id,
             seq: self.seq,
         });
+        let now = Instant::now();
         for peer in &self.peers {
             if let Err(err) = self.socket.send_to(&packet, *peer).await {
-                tracing::warn!(%peer, error = %err, "sending a heartbeat failed");
+                if self.warnings.allow(*peer.ip(), "send failed", now) {
+                    tracing::warn!(%peer, error = %err, "sending a heartbeat failed");
+                }
             }
         }
     }
@@ -298,8 +351,7 @@ impl Node {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn strangers_share_one_warning_slot() {
+    async fn test_node() -> Node {
         let cfg = Config::from_toml(
             r#"
 node_name = "a"
@@ -317,10 +369,28 @@ interface = "fake0"
         .unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (vip_tx, _vip_rx) = mpsc::unbounded_channel();
-        let mut node = Node::new(&cfg, socket, vip_tx);
+        Node::new(&cfg, socket, vip_tx)
+    }
+
+    #[tokio::test]
+    async fn strangers_share_one_warning_slot() {
+        let mut node = test_node().await;
         for i in 1..=100u8 {
             let from = SocketAddr::from((Ipv4Addr::new(10, 0, 0, i), 8458));
             assert!(node.heartbeat_event(&[0; PACKET_LEN], from).is_none());
+        }
+        assert_eq!(node.warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receive_errors_are_rate_limited_and_resets_are_expected() {
+        let mut node = test_node().await;
+        for _ in 0..100 {
+            node.receive_failed(&std::io::ErrorKind::ConnectionReset.into());
+        }
+        assert_eq!(node.warnings.len(), 0, "a reset follows a heartbeat sent to a stopped peer");
+        for _ in 0..100 {
+            node.receive_failed(&std::io::Error::other("boom"));
         }
         assert_eq!(node.warnings.len(), 1);
     }

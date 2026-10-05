@@ -2,6 +2,7 @@
 //! (spec §16 item 5). Linux routes all of 127.0.0.0/8 to the loopback interface.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,13 +11,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use vipd::config::Config;
+use vipd::proto::Codec;
 use vipd::runtime;
 use vipd::vip::fake::FakeBackend;
+use vipd::vip::VipBackend;
 
 const VIP: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 1);
+const KEY: &str = "integration-test-key";
 
-/// One free UDP address per IP. All sockets are held until every port is chosen, so the
-/// ports are distinct.
+/// One free UDP address per IP. All sockets are held until every port is chosen, so the ports are
+/// distinct. They stay free only until this returns, so bind any other socket on these IPs first.
 fn free_addrs(ips: &[Ipv4Addr]) -> Vec<SocketAddrV4> {
     let sockets: Vec<StdUdpSocket> = ips.iter().map(|ip| StdUdpSocket::bind((*ip, 0)).unwrap()).collect();
     sockets
@@ -29,6 +33,11 @@ fn free_addrs(ips: &[Ipv4Addr]) -> Vec<SocketAddrV4> {
 }
 
 fn config(bind: SocketAddrV4, peers: &[SocketAddrV4], priority: u8) -> Config {
+    config_with(bind, peers, priority, "")
+}
+
+/// `extra` is appended after the `[[vip]]` table, e.g. a `[[check]]` or `[hooks]` table.
+fn config_with(bind: SocketAddrV4, peers: &[SocketAddrV4], priority: u8, extra: &str) -> Config {
     let peers: Vec<String> = peers.iter().map(|p| format!("\"{p}\"")).collect();
     let text = format!(
         r#"
@@ -36,7 +45,7 @@ node_name = "node-{priority}"
 group_id = 7
 priority = {priority}
 advert_interval_ms = 50
-auth_key = "integration-test-key"
+auth_key = "{KEY}"
 bind = "{bind}"
 peers = [{peers}]
 
@@ -44,6 +53,7 @@ peers = [{peers}]
 ip = "{VIP}"
 prefix = 24
 interface = "fake0"
+{extra}
 "#,
         peers = peers.join(", ")
     );
@@ -58,7 +68,10 @@ struct Node {
 
 impl Node {
     fn start(cfg: Config) -> Self {
-        let fake = FakeBackend::new();
+        Self::start_with(cfg, FakeBackend::new())
+    }
+
+    fn start_with(cfg: Config, fake: FakeBackend) -> Self {
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(runtime::run(cfg, fake.clone(), async move {
             let _ = stopped.await;
@@ -70,10 +83,11 @@ impl Node {
         self.fake.is_attached(VIP)
     }
 
-    /// A clean stop: the node says goodbye and detaches.
-    async fn stop(self) {
+    /// A clean stop: the node says goodbye and detaches. Returns its backend for inspection.
+    async fn stop(self) -> FakeBackend {
         let _ = self.stop.send(());
         self.task.await.unwrap().unwrap();
+        self.fake
     }
 
     /// A crash: the node vanishes without a goodbye. Returns its backend for inspection.
@@ -91,6 +105,10 @@ async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 #[tokio::test]
 async fn failover_preemption_and_crash() {
     let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 11), Ipv4Addr::new(127, 0, 0, 12), Ipv4Addr::new(127, 0, 0, 13)]);
@@ -100,8 +118,9 @@ async fn failover_preemption_and_crash() {
     let node_c = Node::start(config(c, &[a, b], 50));
     wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip() && !node_c.holds_vip()).await;
 
-    // A stops cleanly and says goodbye, so B takes over after just its skew.
-    node_a.stop().await;
+    // A stops cleanly: it removes the VIP and says goodbye, so B takes over after just its skew.
+    let stopped = node_a.stop().await;
+    assert!(!stopped.is_attached(VIP), "a clean stop removes the VIP");
     wait_until("B takes over", || node_b.holds_vip() && !node_c.holds_vip()).await;
 
     // A returns with the higher priority and takes the VIP back.
@@ -117,40 +136,141 @@ async fn failover_preemption_and_crash() {
     node_c.stop().await;
 }
 
-/// Forwards UDP that arrives on `listen_ip` to `target`, sending from `source_ip` so the receiver
-/// sees the original sender's IP. Drops everything while `cut` is set.
-async fn relay(
-    listen_ip: Ipv4Addr,
-    source_ip: Ipv4Addr,
-    target: SocketAddrV4,
-    cut: Arc<AtomicBool>,
-) -> (SocketAddrV4, JoinHandle<()>) {
-    let inbound = UdpSocket::bind((listen_ip, 0)).await.unwrap();
-    let outbound = UdpSocket::bind((source_ip, 0)).await.unwrap();
-    let std::net::SocketAddr::V4(listen) = inbound.local_addr().unwrap() else { unreachable!() };
-    let handle = tokio::spawn(async move {
-        let mut buf = [0u8; 256];
-        while let Ok((len, _)) = inbound.recv_from(&mut buf).await {
-            if !cut.load(Ordering::SeqCst) {
-                let _ = outbound.send_to(&buf[..len], target).await;
-            }
+#[tokio::test]
+async fn a_clean_stop_says_goodbye_with_priority_0() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 41), Ipv4Addr::new(127, 0, 0, 42)]);
+    // A plain socket stands in for the peer. It never answers, so the node becomes master.
+    let peer = UdpSocket::bind(addrs[1]).await.unwrap();
+    let node = Node::start(config(addrs[0], &[addrs[1]], 150));
+    wait_until("the node becomes master", || node.holds_vip()).await;
+    let backend = node.stop().await;
+    assert!(!backend.is_attached(VIP), "a clean stop removes the VIP");
+
+    let codec = Codec::new(KEY.as_bytes());
+    let mut buf = [0u8; 128];
+    let mut last = None;
+    while let Ok(Ok((len, _))) = tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut buf)).await {
+        last = Some(codec.decode(&buf[..len]).unwrap());
+    }
+    assert_eq!(last.expect("the node sent heartbeats").priority, 0, "the last heartbeat is the goodbye");
+}
+
+#[tokio::test]
+async fn start_up_removes_a_leftover_vip_or_refuses_to_run() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 51), Ipv4Addr::new(127, 0, 0, 52)]);
+    let cfg = config(addrs[0], &[addrs[1]], 100);
+    let fake = FakeBackend::new();
+    fake.attach(&cfg.vips[0]).await.unwrap(); // left over from a crash
+    runtime::run(cfg.clone(), fake.clone(), tokio::time::sleep(Duration::from_millis(100))).await.unwrap();
+    assert_eq!(fake.calls()[1], format!("detach {VIP}"), "the leftover VIP is removed first");
+    assert!(!fake.is_attached(VIP));
+
+    fake.attach(&cfg.vips[0]).await.unwrap();
+    fake.set_fail_detach(true);
+    let err = runtime::run(cfg, fake, std::future::pending()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("cannot remove leftover VIP"), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_failing_check_hands_the_vip_to_the_peer_and_hooks_run() {
+    let dir = std::env::temp_dir();
+    let flag = dir.join(format!("vipd-test-flag-{}", std::process::id()));
+    let hook_log = dir.join(format!("vipd-test-hooks-{}", std::process::id()));
+    let _ = std::fs::remove_file(&flag);
+    let _ = std::fs::remove_file(&hook_log);
+    let extra = format!(
+        r#"
+[[check]]
+name = "flag"
+command = 'sh -c "! test -e {flag}"'
+interval_ms = 100
+weight = -60
+
+[hooks]
+on_master = 'sh -c "echo $VIPD_STATE $VIPD_PRIORITY >> {hook_log}"'
+"#,
+        flag = flag.display(),
+        hook_log = hook_log.display()
+    );
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 61), Ipv4Addr::new(127, 0, 0, 62)]);
+    let node_a = Node::start(config_with(addrs[0], &[addrs[1]], 150, &extra));
+    let node_b = Node::start(config(addrs[1], &[addrs[0]], 100));
+    wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
+    wait_until("A's on_master hook ran", || read(&hook_log).starts_with("MASTER 150")).await;
+
+    // The check now fails, so A drops to 150 - 60 = 90, below B.
+    std::fs::write(&flag, "").unwrap();
+    wait_until("B takes over", || node_b.holds_vip() && !node_a.holds_vip()).await;
+
+    // The check passes again: A is back at 150 and preempts B.
+    std::fs::remove_file(&flag).unwrap();
+    wait_until("A takes the VIP back", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    node_a.stop().await;
+    node_b.stop().await;
+    let _ = std::fs::remove_file(hook_log);
+}
+
+#[tokio::test]
+async fn a_node_that_cannot_attach_leaves_the_vip_to_its_peer() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 71), Ipv4Addr::new(127, 0, 0, 72)]);
+    let broken = FakeBackend::new();
+    broken.set_fail_attach(true);
+    let node_a = Node::start_with(config(addrs[0], &[addrs[1]], 150), broken);
+    let node_b = Node::start(config(addrs[1], &[addrs[0]], 100));
+    wait_until("B holds the VIP", || node_b.holds_vip() && !node_a.holds_vip()).await;
+    node_a.stop().await;
+    node_b.stop().await;
+}
+
+/// The two sockets of a one-way UDP relay. Binding them before `free_addrs` keeps them from taking
+/// a port chosen for a node.
+struct RelaySockets {
+    inbound: UdpSocket,
+    outbound: UdpSocket,
+}
+
+impl RelaySockets {
+    async fn bind(listen_ip: Ipv4Addr, source_ip: Ipv4Addr) -> Self {
+        Self {
+            inbound: UdpSocket::bind((listen_ip, 0)).await.unwrap(),
+            outbound: UdpSocket::bind((source_ip, 0)).await.unwrap(),
         }
-    });
-    (listen, handle)
+    }
+
+    fn listen_addr(&self) -> SocketAddrV4 {
+        let std::net::SocketAddr::V4(addr) = self.inbound.local_addr().unwrap() else { unreachable!() };
+        addr
+    }
+
+    /// Forwards what arrives to `target`, sending from the source IP so the receiver sees the
+    /// original sender's IP. Drops everything while `cut` is set.
+    fn spawn(self, target: SocketAddrV4, cut: Arc<AtomicBool>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            while let Ok((len, _)) = self.inbound.recv_from(&mut buf).await {
+                if !cut.load(Ordering::SeqCst) {
+                    let _ = self.outbound.send_to(&buf[..len], target).await;
+                }
+            }
+        })
+    }
 }
 
 #[tokio::test]
 async fn split_brain_forms_and_heals() {
     let (ip_a, ip_b) = (Ipv4Addr::new(127, 0, 0, 21), Ipv4Addr::new(127, 0, 0, 22));
+    // A talks to B through one relay, B to A through another.
+    let to_b = RelaySockets::bind(ip_b, ip_a).await;
+    let to_a = RelaySockets::bind(ip_a, ip_b).await;
     let addrs = free_addrs(&[ip_a, ip_b]);
     let (a, b) = (addrs[0], addrs[1]);
     let cut = Arc::new(AtomicBool::new(false));
-    // A talks to B through one relay, B to A through another.
-    let (to_b, relay_ab) = relay(ip_b, ip_a, b, cut.clone()).await;
-    let (to_a, relay_ba) = relay(ip_a, ip_b, a, cut.clone()).await;
 
-    let node_a = Node::start(config(a, &[to_b], 150));
-    let node_b = Node::start(config(b, &[to_a], 100));
+    let node_a = Node::start(config(a, &[to_b.listen_addr()], 150));
+    let node_b = Node::start(config(b, &[to_a.listen_addr()], 100));
+    let relay_ab = to_b.spawn(b, cut.clone());
+    let relay_ba = to_a.spawn(a, cut.clone());
     wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
 
     cut.store(true, Ordering::SeqCst);
