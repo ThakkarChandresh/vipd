@@ -22,13 +22,19 @@ pub fn init_stdout(level: &str) {
     log_panics();
 }
 
-/// Logs to `<dir>/vipd.log`, rotated daily. Keep the returned guard alive so logs get flushed.
+/// Logs to `<dir>/vipd.YYYY-MM-DD.log`, a new file each day (UTC), keeping the last 14. Writes are
+/// synchronous, so nothing is lost when the service process ends right after its last line.
 #[cfg(windows)]
-pub fn init_file(dir: &std::path::Path, level: &str) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
+pub fn init_file(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
+    use tracing_appender::rolling::{RollingFileAppender, Rotation};
     std::fs::create_dir_all(dir)?;
-    let appender = tracing_appender::rolling::daily(dir, "vipd.log");
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    let _ = tracing_subscriber::fmt().with_env_filter(filter(level)).with_ansi(false).with_writer(writer).try_init();
+    let appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("vipd")
+        .filename_suffix("log")
+        .max_log_files(14)
+        .build(dir)?;
+    let _ = tracing_subscriber::fmt().with_env_filter(filter(level)).with_ansi(false).with_writer(appender).try_init();
     log_panics();
-    Ok(guard)
+    Ok(())
 }
