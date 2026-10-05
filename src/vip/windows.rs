@@ -51,13 +51,18 @@ pub fn detach_args(vip: &Vip) -> Vec<String> {
     strings(&["netsh", "interface", "ipv4", "delete", "address", &vip.interface, &vip.ip.to_string(), "store=active"])
 }
 
-/// PowerShell that waits up to 3 s for duplicate-address detection to finish, then prints the state.
-pub fn address_state_args(ip: Ipv4Addr) -> Vec<String> {
+/// PowerShell that waits up to 3 s for duplicate-address detection to finish for the VIP on its
+/// interface, then prints the state. The script contains no double quotes, so Windows command-line
+/// quoting cannot change it. A `'` in the adapter name is doubled, as single-quoted PowerShell
+/// strings require, and `-eq` compares the name exactly (no wildcards).
+pub fn address_state_args(vip: &Vip) -> Vec<String> {
+    let alias = vip.interface.replace('\'', "''");
     let script = format!(
         "$d=(Get-Date).AddSeconds(3); do {{ $s=(Get-NetIPAddress -IPAddress '{ip}' \
-         -ErrorAction SilentlyContinue | Select-Object -First 1).AddressState; \
-         if ($s -ne 'Tentative') {{ break }}; Start-Sleep -Milliseconds 250 }} \
-         while ((Get-Date) -lt $d); \"$s\""
+         -ErrorAction SilentlyContinue | Where-Object InterfaceAlias -eq '{alias}' | \
+         Select-Object -First 1).AddressState; if ($s -ne 'Tentative') {{ break }}; \
+         Start-Sleep -Milliseconds 250 }} while ((Get-Date) -lt $d); [string]$s",
+        ip = vip.ip
     );
     strings(&["powershell", "-NoProfile", "-NonInteractive", "-Command", &script])
 }
@@ -81,6 +86,15 @@ pub fn parse_address_state(output: &str) -> AddressState {
     }
 }
 
+/// Runs the duplicate-address check. `Err` says why the check itself could not run.
+async fn check_address_state(vip: &Vip) -> Result<AddressState, String> {
+    match exec::run(&address_state_args(vip), COMMAND_TIMEOUT, &[]).await {
+        Ok(out) if out.success => Ok(parse_address_state(&out.stdout)),
+        Ok(out) => Err(out.failure()),
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
 /// True if `ip` appears as a whole whitespace-separated token. Works in any Windows language.
 pub fn output_has_ip(output: &str, ip: Ipv4Addr) -> bool {
     let wanted = ip.to_string();
@@ -100,13 +114,22 @@ impl VipBackend for WindowsBackend {
     async fn attach(&self, vip: &Vip) -> anyhow::Result<()> {
         for attempt in 1..=ATTACH_ATTEMPTS {
             exec::run_ok(&attach_args(vip), COMMAND_TIMEOUT).await.map_err(|e| e.context(DHCP_HINT))?;
-            let out = exec::run(&address_state_args(vip.ip), COMMAND_TIMEOUT, &[]).await?;
-            match parse_address_state(&out.stdout) {
+            let state = match check_address_state(vip).await {
+                Ok(state) => state,
+                Err(reason) => {
+                    // Windows still runs duplicate-address detection itself; only the retry is lost.
+                    tracing::warn!(vip = %vip.ip, %reason, "cannot check the VIP for a duplicate address; keeping it");
+                    return Ok(());
+                }
+            };
+            match state {
                 AddressState::Preferred => return Ok(()),
                 AddressState::Duplicate => {
-                    tracing::warn!(vip = %vip.ip, attempt, "Windows marked the VIP Duplicate; retrying");
+                    tracing::warn!(vip = %vip.ip, attempt, "Windows marked the VIP Duplicate; removing it");
                     exec::run_ok(&detach_args(vip), COMMAND_TIMEOUT).await?;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if attempt < ATTACH_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
                 AddressState::Missing => {
                     anyhow::bail!("{} is not on {} after adding it", vip.ip, vip.interface)
@@ -166,13 +189,18 @@ mod tests {
         assert_eq!(parse_address_state("Preferred\r\n"), AddressState::Preferred);
         assert_eq!(parse_address_state("\r\nDuplicate\r\n"), AddressState::Duplicate);
         assert_eq!(parse_address_state(""), AddressState::Missing);
+        assert_eq!(parse_address_state("Tentative"), AddressState::Tentative);
         assert_eq!(parse_address_state("Deprecated"), AddressState::Other("Deprecated".into()));
     }
 
     #[test]
-    fn the_powershell_script_targets_the_vip() {
-        let args = address_state_args(Ipv4Addr::new(192, 168, 1, 201));
+    fn the_powershell_script_targets_the_vip_on_its_interface() {
+        let mut v = vip();
+        v.interface = "Bob's NIC".into();
+        let args = address_state_args(&v);
         assert_eq!(&args[..4], &["powershell", "-NoProfile", "-NonInteractive", "-Command"]);
         assert!(args[4].contains("Get-NetIPAddress -IPAddress '192.168.1.201'"), "{}", args[4]);
+        assert!(args[4].contains("Where-Object InterfaceAlias -eq 'Bob''s NIC'"), "{}", args[4]);
+        assert!(!args[4].contains('"'), "no double quotes: {}", args[4]);
     }
 }
