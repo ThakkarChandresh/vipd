@@ -14,6 +14,11 @@ impl WarnLimiter {
         Self { window, last: HashMap::new() }
     }
 
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.last.len()
+    }
+
     /// True if this (peer, reason) warning should be logged now.
     pub fn allow(&mut self, peer: Ipv4Addr, reason: &'static str, now: Instant) -> bool {
         match self.last.get(&(peer, reason)) {

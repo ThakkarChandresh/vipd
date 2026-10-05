@@ -164,3 +164,15 @@ async fn split_brain_forms_and_heals() {
     relay_ab.abort();
     relay_ba.abort();
 }
+
+#[tokio::test]
+async fn a_dead_vip_worker_stops_the_node() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 31), Ipv4Addr::new(127, 0, 0, 32)]);
+    let fake = FakeBackend::new();
+    fake.set_panic_on_attach(true);
+    // The only peer never answers, so the node becomes master and the worker panics attaching.
+    let node = runtime::run(config(addrs[0], &[addrs[1]], 100), fake, std::future::pending());
+    let result = tokio::time::timeout(Duration::from_secs(5), node).await.expect("the node stops by itself");
+    let err = result.expect_err("a dead VIP worker is fatal");
+    assert!(err.to_string().contains("VIP worker"), "{err:#}");
+}

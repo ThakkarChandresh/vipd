@@ -19,6 +19,7 @@ struct Inner {
     calls: Mutex<Vec<String>>,
     fail_attach: AtomicBool,
     fail_detach: AtomicBool,
+    panic_attach: AtomicBool,
 }
 
 impl FakeBackend {
@@ -43,6 +44,11 @@ impl FakeBackend {
         self.inner.fail_detach.store(fail, Ordering::SeqCst);
     }
 
+    /// Makes attach panic, to test what happens when the task running the backend dies.
+    pub fn set_panic_on_attach(&self, panic: bool) {
+        self.inner.panic_attach.store(panic, Ordering::SeqCst);
+    }
+
     fn record(&self, call: String) {
         self.inner.calls.lock().unwrap().push(call);
     }
@@ -59,6 +65,7 @@ impl VipBackend for FakeBackend {
 
     async fn attach(&self, vip: &Vip) -> anyhow::Result<()> {
         self.record(format!("attach {}", vip.ip));
+        assert!(!self.inner.panic_attach.load(Ordering::SeqCst), "simulated panic in attach");
         if self.inner.fail_attach.load(Ordering::SeqCst) {
             anyhow::bail!("simulated attach failure");
         }

@@ -111,7 +111,12 @@ pub async fn run<B: VipBackend>(
                     Some(Event::HealthChanged(health))
                 }
             },
-            Some(WorkerEvent::AttachFailed) = worker_events.recv() => Some(Event::AttachFailed),
+            worker_event = worker_events.recv() => match worker_event {
+                Some(WorkerEvent::AttachFailed) => Some(Event::AttachFailed),
+                // The worker only stops this early if it panicked. Without it no VIP can move, so
+                // exit and let the service manager restart vipd; start-up removes any leftover VIP.
+                None => anyhow::bail!("the VIP worker stopped unexpectedly"),
+            },
             () = sleep_until(deadline) => Some(Event::TimerFired),
         };
         if let Some(event) = event {
@@ -142,8 +147,12 @@ pub async fn run<B: VipBackend>(
         tracing::warn!("timed out waiting for the VIPs to be removed");
     }
     if let Some(stop_hook) = node.stop_hook.take() {
-        let _ = tokio::time::timeout(STOP_HOOK_TIMEOUT, stop_hook).await;
+        if tokio::time::timeout(STOP_HOOK_TIMEOUT, stop_hook).await.is_err() {
+            tracing::warn!("on_stop is still running after 5 s; it is stopped as vipd exits");
+        }
     }
+    // Returning lets the runtime drop every task that is still running, and dropping a command's
+    // future kills its whole process group (hooks included). std::process::exit would skip that.
     Ok(())
 }
 
@@ -203,7 +212,11 @@ impl Node {
         let peer = *from.ip();
         let now = Instant::now();
         if !self.peers.iter().any(|p| *p.ip() == peer) {
-            self.warn(peer, "dropping a packet from an address that is not in peers", now);
+            // Strangers share one limiter slot, so spoofed source addresses can neither grow the
+            // limiter nor flood the log.
+            if self.warnings.allow(Ipv4Addr::UNSPECIFIED, "stranger", now) {
+                tracing::warn!(%peer, "dropping a packet from an address that is not in peers");
+            }
             return None;
         }
         let hb = match self.codec.decode(data) {
@@ -278,5 +291,37 @@ impl Node {
                 tracing::warn!(%peer, error = %err, "sending a heartbeat failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn strangers_share_one_warning_slot() {
+        let cfg = Config::from_toml(
+            r#"
+node_name = "a"
+group_id = 1
+priority = 100
+auth_key = "0123456789abcdef"
+bind = "127.0.0.1:8458"
+peers = ["127.0.0.2:8458"]
+
+[[vip]]
+ip = "10.99.0.1"
+interface = "fake0"
+"#,
+        )
+        .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (vip_tx, _vip_rx) = mpsc::unbounded_channel();
+        let mut node = Node::new(&cfg, socket, vip_tx);
+        for i in 1..=100u8 {
+            let from = SocketAddr::from((Ipv4Addr::new(10, 0, 0, i), 8458));
+            assert!(node.heartbeat_event(&[0; PACKET_LEN], from).is_none());
+        }
+        assert_eq!(node.warnings.len(), 1);
     }
 }
