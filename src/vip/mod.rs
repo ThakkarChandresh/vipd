@@ -1,6 +1,7 @@
 //! Attaching and detaching VIPs with each OS's own commands (spec §7).
 
 pub mod fake;
+pub mod garp;
 
 use std::future::Future;
 use std::net::Ipv4Addr;
