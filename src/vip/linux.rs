@@ -33,14 +33,17 @@ pub fn detach_args(vip: &Vip, found: &str) -> Vec<String> {
     strings(&["ip", "addr", "del", found, "dev", &vip.interface])
 }
 
-/// Finds `ip` in `ip -o -4 addr show` output and returns its `ip/prefix` token.
+/// Finds `ip` in `ip -o -4 addr show` output and returns its `ip/prefix` token. A point-to-point
+/// address prints as `inet LOCAL peer PEER/PREFIX`; its bare `LOCAL` is not an `ip/prefix` token, so
+/// it never matches.
 pub fn parse_find(output: &str, ip: Ipv4Addr) -> Option<String> {
     let wanted = ip.to_string();
     output.lines().find_map(|line| {
         let mut tokens = line.split_whitespace();
         tokens.find(|token| *token == "inet")?;
         let addr = tokens.next()?;
-        (addr.split('/').next() == Some(wanted.as_str())).then(|| addr.to_string())
+        let (address, _prefix) = addr.split_once('/')?;
+        (address == wanted).then(|| addr.to_string())
     })
 }
 
@@ -87,6 +90,15 @@ mod tests {
         assert_eq!(parse_find(SAMPLE, Ipv4Addr::new(192, 168, 1, 13)), Some("192.168.1.13/24".into()));
         assert_eq!(parse_find(SAMPLE, Ipv4Addr::new(192, 168, 1, 20)), None);
         assert_eq!(parse_find("", Ipv4Addr::new(192, 168, 1, 20)), None);
+        let peer = "5: tun0    inet 10.10.0.1 peer 10.10.0.2/32 scope global tun0\\       valid_lft forever";
+        assert_eq!(parse_find(peer, Ipv4Addr::new(10, 10, 0, 1)), None);
+    }
+
+    #[tokio::test]
+    async fn checks_whether_an_interface_exists() {
+        let backend = LinuxBackend::new();
+        assert!(backend.interface_exists("lo").await.unwrap());
+        assert!(!backend.interface_exists("vipd-no-such0").await.unwrap());
     }
 
     #[test]
