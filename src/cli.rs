@@ -13,7 +13,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run in the foreground until SIGTERM, SIGINT or Ctrl+C.
+    /// Run in the foreground until SIGTERM, SIGHUP, SIGINT or Ctrl+C.
     Run {
         #[arg(long, value_name = "PATH", default_value_os_t = default_config_path())]
         config: PathBuf,

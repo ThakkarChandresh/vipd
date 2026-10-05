@@ -27,7 +27,7 @@ Copy [examples/vipd.toml](examples/vipd.toml) to every node.
 - **Firewall:** allow UDP port 8458 (or your `bind` port) between the nodes.
 - **VIP prefix:** keep the default `/32`. On Linux, a VIP with the same prefix length as the interface's own address (say `/24`) becomes a secondary address, and the kernel deletes it whenever the primary address is removed, for example by a DHCP change. If you need the subnet prefix, also set `net.ipv4.conf.<interface>.promote_secondaries=1`.
 - **Windows paths:** write them in single quotes, which TOML reads literally: `log_dir = 'D:\vipd\logs'`. In double quotes, `\t`, `\n` and the like silently become control characters. The same goes for check and hook commands.
-- **Config changes** take effect when vipd restarts (`sudo systemctl restart vipd`, or `Restart-Service vipd` on Windows); there is no reload. SIGHUP stops vipd cleanly, like SIGTERM.
+- **Config changes** take effect when vipd restarts (`sudo systemctl restart vipd`, or `Restart-Service vipd` on Windows); there is no reload. SIGHUP stops vipd cleanly, like SIGTERM, unless vipd was started under `nohup`.
 
 To check a config without starting anything (it has to read the file, hence `sudo`):
 
@@ -78,6 +78,7 @@ The service runs the `vipd.exe` it was installed from, so keep it in a folder on
 - **Restarts:** after a failure, including an invalid config, Windows restarts vipd after 5 s, then 5 s, then every minute. To stop a restart loop, run `sc.exe config vipd start= disabled`; after fixing the cause, run `sc.exe config vipd start= auto` and `sc.exe start vipd`.
 - **Errors:** a failed vipd leaves a Service Control Manager event (ID 7024) in the System log with its exit code as a "service-specific error". Event Viewer words that code as an unrelated Windows message: "Incorrect function." means 1, a runtime failure, and "The system cannot find the file specified." means 2, an invalid config. The vipd log has the details.
 - **Shutdown:** when Windows shuts down, vipd hands the VIP over before other services stop.
+- **Console runs:** use the service. In a console, Ctrl+C stops `vipd.exe run` cleanly, but closing the window kills it, and the VIP stays on the node until vipd starts again.
 
 If the adapter gets its IP from DHCP, either give it a static IP or run this once:
 

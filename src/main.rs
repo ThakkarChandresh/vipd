@@ -76,21 +76,40 @@ fn check_config(path: &Path) -> ExitCode {
 }
 
 /// Completes on Ctrl+C, or on SIGTERM (what systemd sends) or SIGHUP on Unix. vipd has no reload,
-/// and SIGHUP's default action would kill it with the VIPs still attached.
+/// and SIGHUP's default action would kill it with the VIPs still attached. A SIGHUP that is already
+/// ignored when vipd starts (`nohup`) stays ignored.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
-        let mut hup = signal(SignalKind::hangup()).expect("cannot listen for SIGHUP");
+        let mut hup = (!sighup_ignored()).then(|| signal(SignalKind::hangup()).expect("cannot listen for SIGHUP"));
+        let hangup = async {
+            match hup.as_mut() {
+                Some(hup) => {
+                    hup.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
-            _ = hup.recv() => {}
+            () = hangup => {}
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Whether SIGHUP is ignored, as `nohup` arranges.
+#[cfg(unix)]
+fn sighup_ignored() -> bool {
+    // SAFETY: with a null new action, sigaction(2) only reads the current action into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
     }
 }

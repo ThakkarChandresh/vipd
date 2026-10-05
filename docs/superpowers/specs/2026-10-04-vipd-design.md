@@ -434,7 +434,7 @@ A single task that owns the backend and processes requests in order.
 
 | Command | Purpose |
 |---|---|
-| `vipd run [--config PATH]` | Run in the foreground. SIGTERM, SIGINT and Ctrl+C trigger a graceful stop. |
+| `vipd run [--config PATH]` | Run in the foreground. SIGTERM, SIGHUP, SIGINT and Ctrl+C trigger a graceful stop; a SIGHUP that is already ignored at start (`nohup`) stays ignored. |
 | `vipd check-config [--config PATH]` | Validate the config and exit with 0 (valid) or 2 (invalid) |
 | `vipd service install [--config PATH]` | Windows only. Registers the service `vipd`: automatic start, LocalSystem, restart after 5 s on failure. |
 | `vipd service uninstall` | Windows only |
@@ -446,7 +446,7 @@ On Linux, the `service` subcommands print an error that points to `packaging/vip
 
 - **Linux** (`packaging/vipd.service`):
   - Runs `ExecStart=/usr/local/bin/vipd run --config /etc/vipd/vipd.toml` as root.
-  - `Restart=on-failure`, `RestartSec=2`.
+  - `Restart=on-failure`, `RestartSec=2` and `RestartPreventExitStatus=2`, because an invalid config does not fix itself.
   - `After=network-online.target` and `Wants=network-online.target`.
   - `WantedBy=multi-user.target`.
   - Logs go to stdout, where journald collects them.
