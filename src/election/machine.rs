@@ -85,6 +85,10 @@ pub struct Machine {
     advert_at: Option<Instant>,
     reannounce_at: Option<Instant>,
     hold_down_until: Option<Instant>,
+    /// Set by a failed attach. Until this node next becomes master on its own, a lower master's
+    /// heartbeats keep it a backup, so a node that cannot hold the VIP cannot keep taking it away
+    /// from one that can.
+    preempt_suspended: bool,
 }
 
 impl Machine {
@@ -101,6 +105,7 @@ impl Machine {
             advert_at: None,
             reannounce_at: None,
             hold_down_until: None,
+            preempt_suspended: false,
         }
     }
 
@@ -146,6 +151,7 @@ impl Machine {
                 if self.state == State::Master {
                     self.leave_master_for_fault(&mut actions);
                     self.hold_down_until = Some(now + self.cfg.hold_down);
+                    self.preempt_suspended = true;
                 }
             }
             Event::Shutdown => {
@@ -165,6 +171,10 @@ impl Machine {
         self.health.effective_priority
     }
 
+    fn preempts(&self) -> bool {
+        self.cfg.preempt && !self.preempt_suspended
+    }
+
     fn on_heartbeat(
         &mut self,
         from: Ipv4Addr,
@@ -178,7 +188,7 @@ impl Machine {
             State::Backup => {
                 if priority == 0 {
                     self.down_at = Some(now + timers::skew(self.mine(), self.master_interval));
-                } else if !self.cfg.preempt || priority >= self.mine() {
+                } else if !self.preempts() || priority >= self.mine() {
                     self.master_interval = interval;
                     self.arm_down(now);
                 }
@@ -253,6 +263,7 @@ impl Machine {
     fn become_master(&mut self, now: Instant, actions: &mut Vec<Action>) {
         self.state = State::Master;
         self.down_at = None;
+        self.preempt_suspended = false;
         // Heartbeat first, so an old master releases the VIP before we announce it.
         actions.push(Action::SendHeartbeat { priority: self.mine() });
         actions.push(Action::AttachVips);
@@ -523,6 +534,29 @@ mod tests {
         let actions = m.handle(Event::TimerFired, t + Duration::from_secs(10));
         assert_eq!(actions, vec![Action::RunHook(HookKind::Backup)]);
         assert_eq!(m.state(), State::Backup);
+    }
+
+    #[test]
+    fn after_a_failed_attach_a_node_stops_preempting_until_it_is_master_again() {
+        let (mut m, t) = master(150);
+        m.handle(Event::AttachFailed, t);
+        let t = t + Duration::from_secs(10);
+        assert_eq!(m.handle(Event::TimerFired, t), vec![Action::RunHook(HookKind::Backup)]);
+        // A lower master's heartbeats now keep this node a backup.
+        for i in 1..=10 {
+            assert!(m.handle(hb(LOWER_IP, 100), t + SEC * i).is_empty());
+        }
+        assert!(m.handle(Event::TimerFired, t + SEC * 12).is_empty());
+        assert_eq!(m.state(), State::Backup);
+        // That master goes silent, so this node takes over, which restores preemption.
+        let silent = m.next_deadline().unwrap();
+        m.handle(Event::TimerFired, silent);
+        assert_eq!(m.state(), State::Master);
+        m.handle(hb(HIGHER_IP, 200), silent + SEC);
+        assert_eq!(m.state(), State::Backup);
+        let down = m.next_deadline();
+        assert!(m.handle(hb(LOWER_IP, 100), silent + SEC * 2).is_empty());
+        assert_eq!(m.next_deadline(), down, "a lower master's heartbeat no longer resets the down timer");
     }
 
     #[test]

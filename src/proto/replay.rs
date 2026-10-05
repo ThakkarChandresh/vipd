@@ -25,17 +25,18 @@ impl ReplayGuard {
 
     /// Returns true, and records the packet, if it is newer than anything accepted from `peer`.
     ///
+    /// Within one run of a peer (one `boot_id`) only a higher `seq` is accepted, however long the
+    /// peer has been silent, so a captured packet can never be replayed. An older `boot_id` is
+    /// accepted after three silent intervals: that is a peer restarted with its clock set back.
+    ///
     /// Preconditions (both guaranteed by the runtime): `interval` comes from a decoded heartbeat,
     /// which `Codec::decode` limits to 50 ms – 60 s, and `peer` is one of the configured peers,
     /// which keeps this map small.
     pub fn accept(&mut self, peer: Ipv4Addr, boot_id: u64, seq: u64, interval: Duration, now: Instant) -> bool {
         let fresh = match self.peers.get(&peer) {
             None => true,
-            Some(last) => {
-                (boot_id == last.boot_id && seq > last.seq)
-                    || boot_id > last.boot_id
-                    || now.duration_since(last.at) >= last.interval * 3
-            }
+            Some(last) if boot_id == last.boot_id => seq > last.seq,
+            Some(last) => boot_id > last.boot_id || now.duration_since(last.at) >= last.interval * 3,
         };
         if fresh {
             self.peers.insert(peer, Seen { boot_id, seq, at: now, interval });
@@ -77,12 +78,21 @@ mod tests {
     }
 
     #[test]
-    fn any_boot_is_accepted_after_three_silent_intervals() {
+    fn an_older_boot_is_accepted_after_three_silent_intervals() {
         let mut guard = ReplayGuard::new();
         let t = Instant::now();
         assert!(guard.accept(PEER, 200, 9, SEC, t));
         assert!(!guard.accept(PEER, 100, 1, SEC, t + SEC * 2));
         assert!(guard.accept(PEER, 100, 1, SEC, t + SEC * 3));
+    }
+
+    #[test]
+    fn a_captured_packet_stays_rejected_however_long_the_peer_is_silent() {
+        let mut guard = ReplayGuard::new();
+        let t = Instant::now();
+        assert!(guard.accept(PEER, 100, 5, SEC, t));
+        assert!(guard.accept(PEER, 100, 6, SEC, t + SEC)); // the goodbye
+        assert!(!guard.accept(PEER, 100, 5, SEC, t + SEC * 60));
     }
 
     #[test]
