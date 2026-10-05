@@ -5,4 +5,5 @@ pub mod config;
 pub mod election;
 pub mod exec;
 pub mod proto;
+pub mod runtime;
 pub mod vip;
