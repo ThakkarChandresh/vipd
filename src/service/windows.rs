@@ -81,7 +81,7 @@ fn install(config: &Path) -> anyhow::Result<()> {
         let _ = service.delete();
         return Err(err);
     }
-    println!("Installed the vipd service. Start it with: sc start vipd");
+    println!("Installed the vipd service. Start it with: sc.exe start vipd");
     Ok(())
 }
 

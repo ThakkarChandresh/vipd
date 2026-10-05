@@ -75,15 +75,18 @@ fn check_config(path: &Path) -> ExitCode {
     }
 }
 
-/// Completes on Ctrl+C, or on SIGTERM on Unix (what systemd sends).
+/// Completes on Ctrl+C, or on SIGTERM (what systemd sends) or SIGHUP on Unix. vipd has no reload,
+/// and SIGHUP's default action would kill it with the VIPs still attached.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
+        let mut hup = signal(SignalKind::hangup()).expect("cannot listen for SIGHUP");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
+            _ = hup.recv() => {}
         }
     }
     #[cfg(not(unix))]

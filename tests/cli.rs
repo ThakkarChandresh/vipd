@@ -61,6 +61,46 @@ fn check_config_rejects_a_missing_file_with_exit_code_2() {
     assert_eq!(message.matches("vipd-cli-test-no-such-file.toml").count(), 1, "the path appears once: {message}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sighup_stops_vipd_cleanly() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    // A free port, so the test does not depend on 18458 being unused.
+    let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let path = config_file("sighup", "lo");
+    let text = std::fs::read_to_string(&path).unwrap().replace(":18458", &format!(":{port}"));
+    std::fs::write(&path, text).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vipd"))
+        .args(["run", "--config", path.to_str().unwrap()])
+        .env("RUST_LOG", "vipd=info")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map(Result::unwrap);
+    // The signal handlers are in place before the election starts.
+    assert!(lines.by_ref().any(|line| line.contains("starting election")));
+    assert!(Command::new("kill").args(["-HUP", &child.id().to_string()]).status().unwrap().success());
+    // Fail rather than hang if vipd ignores the signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("vipd was still running 20 s after SIGHUP");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let rest: Vec<String> = lines.collect();
+    assert_eq!(status.code(), Some(0), "{rest:?}");
+    assert!(rest.iter().any(|line| line.contains("shutting down")), "{rest:?}");
+    let _ = std::fs::remove_file(path);
+}
+
 #[cfg(not(windows))]
 #[test]
 fn service_commands_point_to_the_systemd_unit() {

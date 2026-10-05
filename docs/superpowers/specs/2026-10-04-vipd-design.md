@@ -314,7 +314,7 @@ How the gratuitous ARP is sent:
 
 - **Pass and fail.** Exit code 0 is a pass. Any other exit code is a fail, and so is being killed when `timeout_ms` is reached.
 - **Overlapping runs.** If the previous run of a check is still going, the new run is skipped.
-- **Shell features** are available by writing `sh -c '…'` or `cmd /C …` as the command.
+- **Shell features** are available by writing `sh -c "…"` or `cmd /C "…"` as the command. The §7.4 tokenizer groups words only with double quotes, so in TOML write it as a literal string: `command = 'sh -c "…"'`.
 - **State** (pure, in `state.rs`):
   - Each check is `Ok` or `Failing`.
   - `fall` consecutive failures turn `Ok` into `Failing`, and `rise` consecutive passes turn `Failing` into `Ok`. A result in the other direction resets the count.

@@ -9,6 +9,8 @@ Type=simple
 ExecStart=/usr/local/bin/vipd run --config /etc/vipd/vipd.toml
 Restart=on-failure
 RestartSec=2
+# An invalid config (exit code 2) does not fix itself.
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=multi-user.target
