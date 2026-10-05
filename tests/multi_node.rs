@@ -2,7 +2,6 @@
 //! (spec §16 item 5). Linux routes all of 127.0.0.0/8 to the loopback interface.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,10 +104,6 @@ async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
 #[tokio::test]
 async fn failover_preemption_and_crash() {
     let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 11), Ipv4Addr::new(127, 0, 0, 12), Ipv4Addr::new(127, 0, 0, 13)]);
@@ -171,8 +166,10 @@ async fn start_up_removes_a_leftover_vip_or_refuses_to_run() {
     assert!(format!("{err:#}").contains("cannot remove leftover VIP"), "{err:#}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failing_check_hands_the_vip_to_the_peer_and_hooks_run() {
+    let read = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
     let dir = std::env::temp_dir();
     let flag = dir.join(format!("vipd-test-flag-{}", std::process::id()));
     let hook_log = dir.join(format!("vipd-test-hooks-{}", std::process::id()));
@@ -209,6 +206,28 @@ on_master = 'sh -c "echo $VIPD_STATE $VIPD_PRIORITY >> {hook_log}"'
     node_a.stop().await;
     node_b.stop().await;
     let _ = std::fs::remove_file(hook_log);
+}
+
+#[tokio::test]
+async fn a_stop_during_start_up_still_removes_a_leftover_vip() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 81), Ipv4Addr::new(127, 0, 0, 82)]);
+    let cfg = config(addrs[0], &[addrs[1]], 100);
+    let fake = FakeBackend::new();
+    fake.attach(&cfg.vips[0]).await.unwrap(); // left over from a crash
+    fake.set_detach_delay(Duration::from_millis(300));
+    runtime::run(cfg, fake.clone(), tokio::time::sleep(Duration::from_millis(50))).await.unwrap();
+    assert!(!fake.is_attached(VIP), "the cleanup finished before run returned");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_slow_detach() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 91), Ipv4Addr::new(127, 0, 0, 92)]);
+    let fake = FakeBackend::new();
+    let node = Node::start_with(config(addrs[0], &[addrs[1]], 150), fake.clone());
+    wait_until("the node becomes master", || node.holds_vip()).await;
+    fake.set_detach_delay(Duration::from_millis(300));
+    let backend = node.stop().await;
+    assert!(!backend.is_attached(VIP), "run returned only after the slow detach");
 }
 
 #[tokio::test]

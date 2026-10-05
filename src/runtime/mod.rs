@@ -38,12 +38,28 @@ pub async fn run<B: VipBackend>(
     let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     let manager = Arc::new(VipManager::new(backend, cfg.vip_commands.clone()));
 
-    // A stop during start-up just stops: nothing is held yet. Polling `shutdown` this early also
-    // installs its signal handlers before the slower start-up steps run.
+    // Leftover VIPs are always removed, even if a stop arrives meanwhile: the peer may already hold
+    // them. Watching `shutdown` here also installs its signal handlers before the slower steps.
+    let mut stopping = false;
+    {
+        let cleanup = remove_leftover_vips(&cfg, &manager);
+        tokio::pin!(cleanup);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut shutdown, if !stopping => stopping = true,
+                cleaned = &mut cleanup => break cleaned?,
+            }
+        }
+    }
+    if stopping {
+        return Ok(());
+    }
+    // A stop during the first round of checks just stops: nothing is held yet.
     let mut check_states = tokio::select! {
         biased;
         () = &mut shutdown => return Ok(()),
-        prepared = prepare(&cfg, &manager) => prepared?,
+        states = first_check_round(&cfg) => states?,
     };
     let mut health = current_health(&cfg, &check_states);
 
@@ -126,6 +142,12 @@ pub async fn run<B: VipBackend>(
                     cause = ?event,
                     "state changed"
                 );
+                if event == Event::AttachFailed {
+                    tracing::warn!(
+                        "the VIPs could not be attached: this node will not preempt until it next becomes \
+                         master on its own or restarts"
+                    );
+                }
             }
             node.execute(&machine, actions).await;
         }
@@ -146,18 +168,22 @@ pub async fn run<B: VipBackend>(
     flushed
 }
 
-/// Start-up before the election (spec §11.1): every VIP's interface must exist, leftover VIPs are
-/// removed, and the first round of checks runs, all checks at once.
-async fn prepare<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<Vec<CheckState>> {
+/// Start-up before the election (spec §11.1): every VIP's interface must exist, and VIPs left over
+/// from a crash are removed, so a node never starts out holding one.
+async fn remove_leftover_vips<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<()> {
     for vip in &cfg.vips {
         if !manager.interface_exists(&vip.interface).await? {
             anyhow::bail!("network interface {:?} (for VIP {}) does not exist", vip.interface, vip.ip);
         }
     }
-    // Clean up after a crash: never start out holding a VIP (spec §11.1 step 3).
     for vip in &cfg.vips {
         manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip))?;
     }
+    Ok(())
+}
+
+/// The first round of checks, all at once, before the election starts (spec §8).
+async fn first_check_round(cfg: &Config) -> anyhow::Result<Vec<CheckState>> {
     let mut check_states: Vec<CheckState> = cfg.checks.iter().map(|c| CheckState::new(c.fall, c.rise)).collect();
     let mut first_round = JoinSet::new();
     for (index, spec) in cfg.checks.iter().cloned().enumerate() {
@@ -196,6 +222,12 @@ impl Drop for CheckLoops {
     }
 }
 
+/// 16 random bits, from the random keys std seeds for `HashMap`.
+fn random_u16() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish() as u16
+}
+
 fn current_health(cfg: &Config, states: &[CheckState]) -> Health {
     let weighted: Vec<_> = cfg.checks.iter().zip(states).map(|(spec, state)| (spec.weight, state.status())).collect();
     checks::aggregate(cfg.priority, &weighted)
@@ -228,7 +260,10 @@ struct Node {
 impl Node {
     fn new(cfg: &Config, socket: UdpSocket, vip_tx: mpsc::UnboundedSender<VipRequest>) -> Self {
         let vips: Vec<(Ipv4Addr, u8)> = cfg.vips.iter().map(|v| (v.ip, v.prefix)).collect();
-        let boot_id = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        // The start time keeps boot ids increasing across restarts, and the random low bits keep two
+        // starts in the same millisecond (a host without a real-time clock) apart.
+        let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let boot_id = (ms << 16) | u64::from(random_u16());
         Self {
             socket,
             codec: Codec::new(cfg.auth_key.as_bytes()),

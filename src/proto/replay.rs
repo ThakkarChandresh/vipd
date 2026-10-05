@@ -6,10 +6,15 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 struct Seen {
+    /// The last packet accepted.
     boot_id: u64,
     seq: u64,
     at: Instant,
     interval: Duration,
+    /// The newest run of the peer ever accepted and its highest `seq`. A packet from that run
+    /// always needs a higher `seq`, even after an older run has been accepted since.
+    newest_boot: u64,
+    newest_seq: u64,
 }
 
 /// Remembers the newest packet accepted from each peer.
@@ -25,21 +30,30 @@ impl ReplayGuard {
 
     /// Returns true, and records the packet, if it is newer than anything accepted from `peer`.
     ///
-    /// Within one run of a peer (one `boot_id`) only a higher `seq` is accepted, however long the
-    /// peer has been silent, so a captured packet can never be replayed. An older `boot_id` is
-    /// accepted after three silent intervals: that is a peer restarted with its clock set back.
+    /// Within the newest run of a peer (its highest `boot_id`), and within the last run accepted,
+    /// only a higher `seq` is accepted, however long the peer has been silent. Any other, older
+    /// `boot_id` is accepted after three silent intervals: a peer restarted with its clock set
+    /// back. The limit that remains: packets captured from three runs of a peer let the two older
+    /// runs be replayed in turn while the peer is silent.
     ///
     /// Preconditions (both guaranteed by the runtime): `interval` comes from a decoded heartbeat,
     /// which `Codec::decode` limits to 50 ms – 60 s, and `peer` is one of the configured peers,
     /// which keeps this map small.
     pub fn accept(&mut self, peer: Ipv4Addr, boot_id: u64, seq: u64, interval: Duration, now: Instant) -> bool {
-        let fresh = match self.peers.get(&peer) {
+        let seen = self.peers.get(&peer).copied();
+        let fresh = match seen {
             None => true,
-            Some(last) if boot_id == last.boot_id => seq > last.seq,
-            Some(last) => boot_id > last.boot_id || now.duration_since(last.at) >= last.interval * 3,
+            Some(s) if boot_id == s.newest_boot => seq > s.newest_seq,
+            Some(s) if boot_id > s.newest_boot => true,
+            Some(s) if boot_id == s.boot_id => seq > s.seq,
+            Some(s) => now.duration_since(s.at) >= s.interval * 3,
         };
         if fresh {
-            self.peers.insert(peer, Seen { boot_id, seq, at: now, interval });
+            let (newest_boot, newest_seq) = match seen {
+                Some(s) if boot_id < s.newest_boot => (s.newest_boot, s.newest_seq),
+                _ => (boot_id, seq),
+            };
+            self.peers.insert(peer, Seen { boot_id, seq, at: now, interval, newest_boot, newest_seq });
         }
         fresh
     }
@@ -93,6 +107,34 @@ mod tests {
         assert!(guard.accept(PEER, 100, 5, SEC, t));
         assert!(guard.accept(PEER, 100, 6, SEC, t + SEC)); // the goodbye
         assert!(!guard.accept(PEER, 100, 5, SEC, t + SEC * 60));
+    }
+
+    #[test]
+    fn alternating_two_runs_cannot_replay_the_newest_one() {
+        let mut guard = ReplayGuard::new();
+        let t = Instant::now();
+        assert!(guard.accept(PEER, 100, 7, SEC, t)); // an older run, captured
+        assert!(guard.accept(PEER, 200, 5, SEC, t + SEC)); // the newest run, also captured
+        assert!(guard.accept(PEER, 200, 9, SEC, t + SEC * 2));
+        // The peer goes silent: the older run gets in after three intervals...
+        assert!(guard.accept(PEER, 100, 7, SEC, t + SEC * 6));
+        // ...but the newest run's old packets stay out.
+        assert!(!guard.accept(PEER, 200, 5, SEC, t + SEC * 7));
+        assert!(!guard.accept(PEER, 200, 9, SEC, t + SEC * 12));
+        assert!(guard.accept(PEER, 200, 10, SEC, t + SEC * 13)); // the real peer resumes
+    }
+
+    #[test]
+    fn restarts_with_the_clock_set_back_still_work() {
+        let mut guard = ReplayGuard::new();
+        let t = Instant::now();
+        assert!(guard.accept(PEER, 500, 40, SEC, t));
+        assert!(!guard.accept(PEER, 300, 1, SEC, t + SEC));
+        assert!(guard.accept(PEER, 300, 1, SEC, t + SEC * 4));
+        assert!(guard.accept(PEER, 300, 2, SEC, t + SEC * 5));
+        // Restarted again, still behind the first run.
+        assert!(guard.accept(PEER, 400, 1, SEC, t + SEC * 9));
+        assert!(guard.accept(PEER, 400, 2, SEC, t + SEC * 10));
     }
 
     #[test]

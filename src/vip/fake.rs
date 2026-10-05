@@ -2,8 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::{Vip, VipBackend};
 
@@ -20,6 +21,7 @@ struct Inner {
     fail_attach: AtomicBool,
     fail_detach: AtomicBool,
     panic_attach: AtomicBool,
+    detach_delay_ms: AtomicU64,
 }
 
 impl FakeBackend {
@@ -42,6 +44,11 @@ impl FakeBackend {
 
     pub fn set_fail_detach(&self, fail: bool) {
         self.inner.fail_detach.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes every detach take this long, like a slow OS command.
+    pub fn set_detach_delay(&self, delay: Duration) {
+        self.inner.detach_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// Makes attach panic, to test what happens when the task running the backend dies.
@@ -75,6 +82,10 @@ impl VipBackend for FakeBackend {
 
     async fn detach(&self, vip: &Vip, _found: &str) -> anyhow::Result<()> {
         self.record(format!("detach {}", vip.ip));
+        let delay = self.inner.detach_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.inner.fail_detach.load(Ordering::SeqCst) {
             anyhow::bail!("simulated detach failure");
         }
