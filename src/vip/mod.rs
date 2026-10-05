@@ -2,6 +2,8 @@
 
 pub mod fake;
 pub mod garp;
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 use std::future::Future;
 use std::net::Ipv4Addr;
@@ -11,6 +13,10 @@ use crate::exec;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("vipd supports Linux and Windows only");
+
+/// The backend for the OS this binary was built for.
+#[cfg(target_os = "linux")]
+pub type PlatformBackend = linux::LinuxBackend;
 
 /// Every OS command gets this long before it is killed.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
