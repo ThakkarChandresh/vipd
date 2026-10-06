@@ -163,7 +163,7 @@ Rows are checked from top to bottom, and the first row that matches wins. "Mine"
 
 | State | Event | Actions, then the new state |
 |---|---|---|
-| (new) | `Started`, health OK | Arm down → **Backup** |
+| (new) | `Started`, health OK | `RunHook(Backup)`, arm down → **Backup** |
 | (new) | `Started`, health fault | `RunHook(Fault)` → **Fault** |
 | Backup | Heartbeat, priority 0 | down = `skew` |
 | Backup | Heartbeat, priority ≥ mine, or preemption off | Learn the interval and reset down |
@@ -352,6 +352,10 @@ How the gratuitous ARP is sent:
 
 - **Configuration.** `[hooks]` has optional `on_master`, `on_backup`, `on_fault` and `on_stop` commands, parsed with the §7.4 tokenizer.
 - **Environment.** Each hook receives `VIPD_STATE` (`MASTER`, `BACKUP`, `FAULT` or `STOP`), `VIPD_PRIORITY` (the effective priority) and `VIPD_GROUP`.
+- **When.** A hook runs whenever the machine emits `RunHook` (§5.5): on entering a state, and on a stop.
+  - At start, a node runs `on_backup`, or `on_fault` if its health is in fault. So after a crash as master, the hooks learn that this node is no longer master.
+  - `on_master` starts as the node takes over, at the same time as the VIP worker's attach (§11.3), so the VIP may not be on the interface yet. On Windows the attach takes a few seconds, because it waits for the duplicate-address check (§7.3).
+  - Hooks are not serialized: after quick state changes two can run at once and finish in either order. A hook should act on its `VIPD_STATE`, not on the order the hooks ran in.
 - **Execution.**
   - Hooks run in the background and are killed after 60 s.
   - Failures are only logged and never affect the election.

@@ -134,8 +134,7 @@ impl Machine {
                 if health.fault {
                     self.enter_fault(&mut actions);
                 } else {
-                    self.state = State::Backup;
-                    self.arm_down(now);
+                    self.enter_backup(now, &mut actions);
                 }
             }
             return actions;
@@ -340,7 +339,7 @@ mod tests {
     fn backup(priority: u8) -> (Machine, Instant) {
         let mut m = machine(true);
         let t0 = Instant::now();
-        assert!(m.handle(Event::Started { health: healthy(priority) }, t0).is_empty());
+        assert_eq!(m.handle(Event::Started { health: healthy(priority) }, t0), vec![Action::RunHook(HookKind::Backup)]);
         (m, t0)
     }
 
@@ -358,8 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn starts_as_backup_with_a_full_down_timer() {
-        let (m, t0) = backup(100);
+    fn starts_as_backup_with_the_backup_hook_and_a_full_down_timer() {
+        // After a crash as master, the hook is what tells the scripts that this node is a backup now.
+        let mut m = machine(true);
+        let t0 = Instant::now();
+        let actions = m.handle(Event::Started { health: healthy(100) }, t0);
+        assert_eq!(actions, vec![Action::RunHook(HookKind::Backup)]);
         assert_eq!(m.state(), State::Backup);
         assert_eq!(m.next_deadline(), Some(t0 + DOWN_100));
     }
