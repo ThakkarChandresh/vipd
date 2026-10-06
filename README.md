@@ -92,7 +92,7 @@ To remove the service, run `& 'C:\Program Files\vipd\vipd.exe' service uninstall
 
 - **Why did a failover happen?** Every `state changed` log line includes its cause, and `health changed` lines show the node's effective priority.
 - **A node that cannot attach the VIP** (missing privileges, or a DHCP adapter on Windows) gives it up, and stops preempting until it next becomes master on its own. After fixing the cause, restart vipd on that node.
-- **On Windows,** the warning "cannot check the VIP for a duplicate address; keeping it" means the PowerShell check could not run. Windows still runs its own duplicate detection.
+- **On Windows,** the warning "cannot check the VIP for a duplicate address; keeping it" means the PowerShell check could not run. Windows still runs its own duplicate detection. The warning "the duplicate-address check did not find the VIP; keeping it" usually means `interface` is an adapter index: use the adapter's name.
 - **Moving a VIP to another interface:** remove it from the old interface yourself. vipd only cleans up the interface named in its config.
 - **Outgoing traffic** from the master keeps using the node's own address, unless an application binds to the VIP.
 - **Exit codes:** 0 for a clean stop, 1 for a runtime failure, 2 for an invalid config. After an error exit the Windows service restarts vipd, and so does systemd unless the config is invalid; start-up then removes any VIP left behind. In a terminal, start vipd again yourself.
