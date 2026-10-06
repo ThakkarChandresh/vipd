@@ -101,7 +101,8 @@ pub async fn run<B: VipBackend>(
     let mut buf = [0u8; 2 * PACKET_LEN];
     loop {
         let deadline = machine.next_deadline();
-        // Unbiased on purpose: with `biased;` a flood of packets could starve the branches after `recv_from`, the timer included.
+        // Unbiased on purpose: with `biased;` a flood of packets could starve the branches after
+        // `recv_from`, the timer included.
         let event = tokio::select! {
             () = &mut shutdown => break,
             received = node.socket.recv_from(&mut buf) => match received {
