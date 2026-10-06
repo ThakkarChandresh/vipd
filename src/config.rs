@@ -31,9 +31,17 @@ pub struct HookCommands {
 }
 
 /// The shared heartbeat key. Its `Debug` output is redacted so the secret cannot end up in a log.
-#[derive(Clone, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone)]
 pub struct AuthKey(String);
+
+impl<'de> Deserialize<'de> for AuthKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // serde's own error quotes a wrong-typed value (`auth_key = 4815…` is an integer), so it is replaced.
+        String::deserialize(deserializer)
+            .map(AuthKey)
+            .map_err(|_| serde::de::Error::custom("auth_key must be a quoted string"))
+    }
+}
 
 impl std::ops::Deref for AuthKey {
     type Target = str;
@@ -83,11 +91,20 @@ impl Config {
             // Not `e.to_string()`: that quotes the offending line, which may be the auth_key line.
             let line = e.span().map(|s| text.as_bytes()[..s.start].iter().filter(|&&b| b == b'\n').count() + 1);
             ConfigError::Parse(match line {
-                Some(line) => format!("line {line}: {}", e.message()),
-                None => e.message().to_string(),
+                Some(line) => format!("line {line}: {}", message(&e)),
+                None => message(&e).to_string(),
             })
         })?;
         raw.validate()
+    }
+}
+
+/// toml's message for an error, which is empty for some syntax errors at the end of the file.
+fn message(e: &toml::de::Error) -> &str {
+    if e.message().trim().is_empty() {
+        "invalid TOML syntax"
+    } else {
+        e.message()
     }
 }
 
@@ -560,6 +577,26 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
                 }
                 other => panic!("{case}: expected a parse error, got {other:?}"),
             }
+        }
+
+        // An unquoted number: serde's own error would quote the value.
+        let text = MINIMAL.replace(r#"auth_key = "0123456789abcdef""#, "auth_key = 4815162342108811");
+        match Config::from_toml(&text) {
+            Err(ConfigError::Parse(msg)) => {
+                assert!(!msg.contains("4815162342108811"), "{msg}");
+                assert!(msg.contains("quoted string"), "{msg}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+
+        // A file that ends right after `auth_key =`: toml's own message is empty for this one.
+        let text = format!("{}auth_key =", MINIMAL.split("auth_key").next().unwrap());
+        match Config::from_toml(&text) {
+            Err(ConfigError::Parse(msg)) => {
+                let (_, after_prefix) = msg.split_once(": ").expect("a line-numbered message");
+                assert!(!after_prefix.is_empty(), "{msg:?}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
         }
     }
 
