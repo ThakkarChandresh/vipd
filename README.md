@@ -40,6 +40,7 @@ It lists the problems it finds and exits with 0 if the config is valid, or 2 if 
 ### Checks and hooks
 
 - A check is any command, run without a shell, and exit code 0 passes. Only double quotes group words. For pipes, `&&` or variables, call a shell and write the command as a TOML literal string: `command = 'sh -c "pgrep -x nginx && curl -sf http://127.0.0.1/"'` (on Windows, `'cmd /C "…"'`). Hooks follow the same rules.
+- On Windows the service runs checks and hooks as LocalSystem. Give programs outside `C:\Windows\System32\` by full path, because Windows looks them up in PATH.
 - A check's `weight` (default 0) adjusts the node's priority: a negative weight applies while the check fails, a positive one while it passes, and `weight = 0` takes the node out of the election while the check fails. If a weight-0 check fails on every node, no node holds the VIP.
 - To see why a check fails, set `log_level = "debug"` (or run with `RUST_LOG=vipd=debug`).
 - Hooks get `VIPD_STATE` (`MASTER`, `BACKUP`, `FAULT` or `STOP`), `VIPD_PRIORITY` (the effective priority) and `VIPD_GROUP`. They run in the background and are killed after 60 s; at shutdown vipd waits at most 5 s for `on_stop`. A node runs `on_backup` when it starts, or `on_fault` if a weight-0 check fails at start, so after a crash as master the hooks learn the node's new state. `on_master` starts as the node takes over, at the same time as the VIP attach, so the VIP may not be on the interface yet; on Windows it can be a few seconds before the VIP appears, after the duplicate-address check. Hooks are not serialized, and one that starts first can finish last: a failed attach starts `on_master` and `on_fault` milliseconds apart. So a hook that changes something should act on its `VIPD_STATE`, not on the order the hooks ran in, and should tolerate the VIP appearing a little after `on_master` starts.
@@ -92,7 +93,7 @@ To remove the service, run `& 'C:\Program Files\vipd\vipd.exe' service uninstall
 
 - **Why did a failover happen?** Every `state changed` log line includes its cause, and `health changed` lines show the node's effective priority.
 - **A node that cannot attach the VIP** (missing privileges, or a DHCP adapter on Windows) gives it up, and stops preempting until it next becomes master on its own. After fixing the cause, restart vipd on that node.
-- **On Windows,** the warning "cannot check the VIP for a duplicate address; keeping it" means the PowerShell check could not run. Windows still runs its own duplicate detection.
+- **On Windows,** the warning "cannot check the VIP for a duplicate address; keeping it" means the PowerShell check could not run. Windows still runs its own duplicate detection. The warning "the duplicate-address check did not see the VIP, but netsh does; keeping it" means the same.
 - **Moving a VIP to another interface:** remove it from the old interface yourself. vipd only cleans up the interface named in its config.
 - **Outgoing traffic** from the master keeps using the node's own address, unless an application binds to the VIP.
 - **Exit codes:** 0 for a clean stop, 1 for a runtime failure, 2 for an invalid config. After an error exit the Windows service restarts vipd, and so does systemd unless the config is invalid; start-up then removes any VIP left behind. In a terminal, start vipd again yourself.

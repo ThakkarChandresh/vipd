@@ -298,13 +298,13 @@ How the gratuitous ARP is sent:
 
 - **`store=active`** means the VIP disappears when the machine reboots.
 - **`skipassource=true`** keeps outgoing traffic on the node's own IP.
-- **Duplicate-address check after attach.** Run one PowerShell process: `powershell -NoProfile -NonInteractive -Command <script>`.
+- **Duplicate-address check after attach.** Run one PowerShell process by full path, because the service runs as LocalSystem and a PATH lookup could pick up a planted `powershell.exe`: `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -Command <script>`.
   - The script polls the `AddressState` of the VIP on its own adapter every 250 ms for up to 3 s, until the state is no longer `Tentative`, and prints the final state. The state names are enum values, so they don't depend on the Windows language.
-  - It runs `Get-NetIPAddress -IPAddress '{ip}'` and keeps only the address whose `InterfaceAlias` equals `{iface}` exactly (`-eq`, no wildcards), because another adapter could hold the same IP.
-  - The script contains no double quotes, so Windows command-line quoting cannot change it. A `'` in the adapter name is doubled.
+  - It runs `Get-NetIPAddress -IPAddress '{ip}'` and keeps only the address whose `InterfaceAlias` equals `$env:VIPD_IFACE` exactly (`-eq`, no wildcards), because another adapter could hold the same IP.
+  - The adapter name is not part of the script: it is passed in the `VIPD_IFACE` environment variable and compared with `-eq $env:VIPD_IFACE`, so no character in it can change the script. The script contains no double quotes, so Windows command-line quoting cannot change it either.
   - `Preferred`: done.
   - `Duplicate`: detach, wait 1 s and retry the attach, up to 3 attempts. After that, return an error, which the runtime turns into `AttachFailed`.
-  - Nothing printed: the address is not on the adapter. Return an error, which the runtime turns into `AttachFailed`. Config validation rejects an adapter index, which `netsh` accepts but `InterfaceAlias` never equals.
+  - Nothing printed: netsh is asked again. If it does not list the VIP either, the address is not on the adapter: return an error, which the runtime turns into `AttachFailed` (config validation rejects an adapter index, which `netsh` accepts but `InterfaceAlias` never equals). If netsh does list it, the check failed inside PowerShell: keep the address, with the warning "the duplicate-address check did not see the VIP, but netsh does; keeping it".
   - The check cannot run (PowerShell fails to start, exits with an error or times out): keep the address, with the warning "cannot check the VIP for a duplicate address; keeping it". Windows still runs its own duplicate detection, so a broken PowerShell must not stop a node from ever holding the VIP.
   - Any other state, such as still `Tentative` after 3 s: keep the address, with a warning.
 - **Error hint.** When `netsh … add address` fails, the error adds a hint: if the adapter uses DHCP, run `netsh interface ipv4 set interface interface="<adapter>" dhcpstaticipcoexistence=enabled` once, or give it a static IP.
@@ -318,7 +318,7 @@ How the gratuitous ARP is sent:
   - A `"double-quoted"` segment is one argument, with the quotes removed. There are no escape sequences.
   - The first token is the program.
   - There is no shell.
-- **Running a command** (`exec.rs`). VIP commands, overrides, checks and hooks all run the same way: without a shell, with stdin closed and the output captured, and with vipd's own environment (hooks get their variables on top, §9).
+- **Running a command** (`exec.rs`). VIP commands, overrides, checks and hooks all run the same way: without a shell, with stdin closed and the output captured, and with vipd's own environment (hooks get their variables on top, §9, and the duplicate-address check gets `VIPD_IFACE`).
   - On Linux every command runs in its own process group, and the whole group is killed on timeout or when the run is cancelled (for example at shutdown), so the children of an `sh -c` wrapper die too. A descendant that moves to a group or session of its own (`setsid`) still escapes.
   - On Windows only the direct process is killed; the rest would need a Job Object.
 - **Placeholders** are `{ip}`, `{prefix}`, `{mask}` and `{iface}`. They are substituted inside each token *after* splitting, so a value containing a space (such as `Ethernet 2`) stays a single argument.

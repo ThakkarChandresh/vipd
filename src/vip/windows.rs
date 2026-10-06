@@ -52,19 +52,22 @@ pub fn detach_args(vip: &Vip) -> Vec<String> {
 }
 
 /// PowerShell that waits up to 3 s for duplicate-address detection to finish for the VIP on its
-/// interface, then prints the state. The script contains no double quotes, so Windows command-line
-/// quoting cannot change it. A `'` in the adapter name is doubled, as single-quoted PowerShell
-/// strings require, and `-eq` compares the name exactly (no wildcards).
+/// interface, then prints the state. PowerShell runs by full path, because the service runs as
+/// LocalSystem and a PATH lookup could pick up a planted `powershell.exe`. The adapter name is not
+/// part of the script: the caller passes it in the `VIPD_IFACE` environment variable, and `-eq`
+/// compares it exactly (no wildcards), so no character in it can change the script. The script
+/// contains no double quotes, so Windows command-line quoting cannot change it either.
 pub fn address_state_args(vip: &Vip) -> Vec<String> {
-    let alias = vip.interface.replace('\'', "''");
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let powershell = format!(r"{}\System32\WindowsPowerShell\v1.0\powershell.exe", root.to_string_lossy());
     let script = format!(
         "$d=(Get-Date).AddSeconds(3); do {{ $s=(Get-NetIPAddress -IPAddress '{ip}' \
-         -ErrorAction SilentlyContinue | Where-Object InterfaceAlias -eq '{alias}' | \
+         -ErrorAction SilentlyContinue | Where-Object InterfaceAlias -eq $env:VIPD_IFACE | \
          Select-Object -First 1).AddressState; if ($s -ne 'Tentative') {{ break }}; \
          Start-Sleep -Milliseconds 250 }} while ((Get-Date) -lt $d); [string]$s",
         ip = vip.ip
     );
-    strings(&["powershell", "-NoProfile", "-NonInteractive", "-Command", &script])
+    strings(&[&powershell, "-NoProfile", "-NonInteractive", "-Command", &script])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +91,7 @@ pub fn parse_address_state(output: &str) -> AddressState {
 
 /// Runs the duplicate-address check. `Err` says why the check itself could not run.
 async fn check_address_state(vip: &Vip) -> Result<AddressState, String> {
-    match exec::run(&address_state_args(vip), COMMAND_TIMEOUT, &[]).await {
+    match exec::run(&address_state_args(vip), COMMAND_TIMEOUT, &[("VIPD_IFACE", vip.interface.clone())]).await {
         Ok(out) if out.success => Ok(parse_address_state(&out.stdout)),
         Ok(out) => Err(out.failure()),
         Err(err) => Err(format!("{err:#}")),
@@ -132,6 +135,15 @@ impl VipBackend for WindowsBackend {
                     }
                 }
                 AddressState::Missing => {
+                    // The script silences WMI/CIM errors, so an empty answer can also mean the check failed
+                    // inside PowerShell. netsh added the address, so ask it before failing the attach.
+                    if self.find(vip).await?.is_some() {
+                        tracing::warn!(
+                            vip = %vip.ip,
+                            "the duplicate-address check did not see the VIP, but netsh does; keeping it"
+                        );
+                        return Ok(());
+                    }
                     // Config validation rejects an adapter index, which the InterfaceAlias filter could not
                     // match, so a missing address means the attach really failed.
                     anyhow::bail!("{} is not on {} after adding it", vip.ip, vip.interface)
@@ -200,9 +212,11 @@ mod tests {
         let mut v = vip();
         v.interface = "Bob's NIC".into();
         let args = address_state_args(&v);
-        assert_eq!(&args[..4], &["powershell", "-NoProfile", "-NonInteractive", "-Command"]);
+        assert!(args[0].ends_with(r"\System32\WindowsPowerShell\v1.0\powershell.exe"), "{}", args[0]);
+        assert_eq!(&args[1..4], &["-NoProfile", "-NonInteractive", "-Command"]);
         assert!(args[4].contains("Get-NetIPAddress -IPAddress '192.168.1.201'"), "{}", args[4]);
-        assert!(args[4].contains("Where-Object InterfaceAlias -eq 'Bob''s NIC'"), "{}", args[4]);
+        assert!(args[4].contains("Where-Object InterfaceAlias -eq $env:VIPD_IFACE"), "{}", args[4]);
+        assert!(!args[4].contains("Bob"), "the adapter name stays out of the script: {}", args[4]);
         assert!(!args[4].contains('"'), "no double quotes: {}", args[4]);
     }
 }
