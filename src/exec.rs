@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
+use tokio::io::AsyncReadExt;
 
 /// Splits a command template into arguments.
 ///
@@ -84,19 +85,28 @@ pub async fn run(args: &[String], timeout: Duration, envs: &[(&str, String)]) ->
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    let child = cmd.spawn().with_context(|| format!("cannot start `{}`", args.join(" ")))?;
+    let mut child = cmd.spawn().with_context(|| format!("cannot start `{}`", args.join(" ")))?;
+    // Declared after `child`, so dropped first: the group is killed while the command is at worst an
+    // unreaped zombie, whose PID (and so the group ID) the kernel cannot hand out again.
     let mut group = GroupGuard { pid: child.id(), finished: false };
-    // On timeout the `wait_with_output` future is dropped, which drops (and kills) the child; `group`
-    // then kills anything the child started. Cancelling `run` itself also drops `group`.
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let (mut stdout, mut stderr) =
+        (child.stdout.take().context("no stdout pipe")?, child.stderr.take().context("no stderr pipe")?);
+    let finished = async {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        // Both pipes are read to the end before `wait`, because `wait` reaps the command.
+        tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err))
+    };
+    match tokio::time::timeout(timeout, finished).await {
         Ok(result) => {
-            let out = result.with_context(|| format!("cannot wait for `{}`", args.join(" ")))?;
+            let (status, out, err) = result.with_context(|| format!("cannot wait for `{}`", args.join(" ")))?;
             group.finished = true;
             Ok(Output {
-                success: out.status.success(),
-                code: out.status.code(),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                success: status.success(),
+                code: status.code(),
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
             })
         }
         Err(_) => bail!("`{}` timed out after {:?} and was killed", args.join(" "), timeout),
