@@ -79,7 +79,14 @@ impl Config {
     }
 
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let raw: RawConfig = toml::from_str(text).map_err(|e| {
+            // Not `e.to_string()`: that quotes the offending line, which may be the auth_key line.
+            let line = e.span().map(|s| text.as_bytes()[..s.start].iter().filter(|&&b| b == b'\n').count() + 1);
+            ConfigError::Parse(match line {
+                Some(line) => format!("line {line}: {}", e.message()),
+                None => e.message().to_string(),
+            })
+        })?;
         raw.validate()
     }
 }
@@ -523,6 +530,24 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
         let c = Config::from_toml(MINIMAL).unwrap();
         assert_eq!(&*c.auth_key, "0123456789abcdef");
         assert!(!format!("{c:?}").contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn parse_errors_do_not_quote_the_auth_key() {
+        let cases = [
+            ("a misspelled key", r#"auth_kye = "TOP-SECRET-0123456789""#),
+            ("an unterminated string", r#"auth_key = "TOP-SECRET-0123456789"#),
+        ];
+        for (case, line) in cases {
+            let text = MINIMAL.replace(r#"auth_key = "0123456789abcdef""#, line);
+            match Config::from_toml(&text) {
+                Err(ConfigError::Parse(msg)) => {
+                    assert!(!msg.contains("TOP-SECRET"), "{case}: {msg}");
+                    assert!(msg.contains("line"), "{case}: {msg}");
+                }
+                other => panic!("{case}: expected a parse error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
