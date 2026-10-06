@@ -160,6 +160,9 @@ async fn start_up_removes_a_leftover_vip_or_refuses_to_run() {
     assert_eq!(fake.calls()[1], format!("detach {VIP}"), "the leftover VIP is removed first");
     assert!(!fake.is_attached(VIP));
 
+    // A fresh bind address: run() now binds even when the cleanup below is about to fail, and
+    // rebinding addrs[0] right after the first run() just closed it would race the port's release.
+    let cfg = config(addrs[1], &[addrs[0]], 100);
     fake.attach(&cfg.vips[0]).await.unwrap();
     fake.set_fail_detach(true);
     let err = runtime::run(cfg, fake, std::future::pending()).await.unwrap_err();
@@ -232,7 +235,10 @@ async fn a_stop_during_start_up_still_removes_a_leftover_vip() {
     fake.attach(&cfg.vips[0]).await.unwrap(); // left over from a crash
     runtime::run(cfg.clone(), fake.clone(), async {}).await.unwrap();
     assert!(!fake.is_attached(VIP), "an immediate stop still removes the leftover VIP");
-    // ...and one that comes during a slow detach.
+    // ...and one that comes during a slow detach. A fresh bind address: run() now binds even when
+    // it is about to stop, and rebinding addrs[0] right after the first run() just closed it would
+    // race the port's release.
+    let cfg = config(addrs[1], &[addrs[0]], 100);
     fake.attach(&cfg.vips[0]).await.unwrap();
     fake.set_detach_delay(Duration::from_millis(300));
     runtime::run(cfg, fake.clone(), tokio::time::sleep(Duration::from_millis(50))).await.unwrap();
@@ -406,14 +412,32 @@ async fn a_slow_backend_does_not_replay_a_backlog_after_the_election_settles() {
 
 #[tokio::test]
 async fn a_failed_bind_still_removes_a_leftover_vip() {
-    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 121), Ipv4Addr::new(127, 0, 0, 122)]);
-    let _squatter = UdpSocket::bind(addrs[0]).await.unwrap(); // something else holds the port
-    let cfg = config(addrs[0], &[addrs[1]], 100);
+    // 192.0.2.1 (TEST-NET-1) is not an address of this machine, as when a DHCP change took the bind
+    // IP away. The 2 s stop only matters on a host with net.ipv4.ip_nonlocal_bind set.
+    let bind = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 8458);
+    let peer = free_addrs(&[Ipv4Addr::new(127, 0, 0, 122)])[0];
+    let cfg = config(bind, &[peer], 100);
     let fake = FakeBackend::new();
     fake.attach(&cfg.vips[0]).await.unwrap(); // left over from a crash
-    let err = runtime::run(cfg, fake.clone(), std::future::pending()).await.unwrap_err();
+    let err = runtime::run(cfg, fake.clone(), tokio::time::sleep(Duration::from_secs(2))).await.unwrap_err();
     assert!(format!("{err:#}").contains("cannot bind"), "{err:#}");
     assert!(!fake.is_attached(VIP), "vipd cannot start, and the leftover VIP stays on this node");
+}
+
+#[tokio::test]
+async fn a_second_instance_leaves_the_running_masters_vip_alone() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 171), Ipv4Addr::new(127, 0, 0, 172)]);
+    let cfg = config(addrs[0], &[addrs[1]], 150);
+    let fake = FakeBackend::new();
+    let node = Node::start_with(cfg.clone(), fake.clone());
+    wait_until("the node becomes master", || node.holds_vip()).await;
+    // An operator starts vipd by hand, with the same config, while the service runs. The shared
+    // backend stands for this machine's interfaces.
+    let err = runtime::run(cfg, fake.clone(), std::future::pending()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("another vipd"), "{err:#}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(node.holds_vip(), "the second instance removed the running master's VIP");
+    node.stop().await;
 }
 
 #[tokio::test]

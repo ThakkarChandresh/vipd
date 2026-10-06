@@ -35,6 +35,15 @@ pub async fn run<B: VipBackend>(
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     tokio::pin!(shutdown);
+    // A port that is already in use most likely means that another vipd runs on this node, and the
+    // cleanup below would remove the VIPs it holds. Any other bind failure, such as a `bind` IP that
+    // is gone, is reported after the cleanup.
+    let bound = UdpSocket::bind(cfg.bind).await;
+    if let Err(err) = &bound {
+        if err.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::bail!("cannot bind UDP {}: {err}; is another vipd running on this node?", cfg.bind);
+        }
+    }
     let manager = Arc::new(VipManager::new(backend, cfg.vip_commands.clone()));
 
     // A stop cuts the interface check short; leftover VIPs are still removed below. Polling
@@ -62,7 +71,7 @@ pub async fn run<B: VipBackend>(
     if stopping {
         return Ok(());
     }
-    let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
+    let socket = bound.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     // A stop during the first round of checks just stops: nothing is held yet.
     let mut check_states = tokio::select! {
         biased;
@@ -200,6 +209,9 @@ async fn remove_leftover_vips<B: VipBackend>(cfg: &Config, manager: &VipManager<
     for vip in &cfg.vips {
         let removed =
             manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip));
+        if let Ok(true) = removed {
+            tracing::warn!(vip = %vip.ip, interface = %vip.interface, "removed a VIP left over from an earlier run");
+        }
         result = result.and(removed.map(|_| ())); // keeps the first error
     }
     result
