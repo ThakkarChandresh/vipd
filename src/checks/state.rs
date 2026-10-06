@@ -68,7 +68,7 @@ pub fn aggregate(base: u8, checks: &[(i32, CheckStatus)]) -> Health {
             _ => {}
         }
     }
-    let effective = (i32::from(base) + sum).clamp(1, 254) as u8;
+    let effective = i32::from(base).saturating_add(sum).clamp(1, 254) as u8;
     Health { effective_priority: effective, fault }
 }
 
@@ -156,5 +156,13 @@ mod tests {
     fn the_effective_priority_is_clamped() {
         assert_eq!(aggregate(10, &[(-200, CheckStatus::Failing)]).effective_priority, 1);
         assert_eq!(aggregate(250, &[(100, CheckStatus::Ok)]).effective_priority, 254);
+    }
+
+    #[test]
+    fn extreme_weights_saturate_instead_of_overflowing() {
+        let huge = [(i32::MAX, CheckStatus::Ok), (i32::MAX, CheckStatus::Ok)];
+        assert_eq!(aggregate(100, &huge).effective_priority, 254);
+        let tiny = [(i32::MIN, CheckStatus::Failing), (i32::MIN, CheckStatus::Failing)];
+        assert_eq!(aggregate(100, &tiny).effective_priority, 1);
     }
 }
