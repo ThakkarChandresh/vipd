@@ -278,7 +278,7 @@ pub trait VipBackend: Send + Sync + 'static {
 | announce | Native gratuitous ARP (`garp.rs`), described below |
 
 How the gratuitous ARP is sent:
-- A `socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP))`, with the interface index from `if_nametoindex`.
+- A `socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ARP))`, with the interface index from `if_nametoindex`. Close-on-exec keeps checks and hooks started meanwhile from inheriting it.
 - The interface's MAC address comes from `/sys/class/net/{iface}/address`.
 - The frame:
   - Ethernet: destination `ff:ff:ff:ff:ff:ff`, source our MAC, ethertype `0x0806`.

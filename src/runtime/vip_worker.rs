@@ -124,7 +124,12 @@ async fn attach_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> boo
             Ok(true) => tracing::info!(vip = %vip.ip, interface = %vip.interface, "VIP attached"),
             Ok(false) => {}
             Err(err) => {
-                tracing::error!(vip = %vip.ip, interface = %vip.interface, error = %format!("{err:#}"), "attaching the VIP failed");
+                tracing::error!(
+                    vip = %vip.ip,
+                    interface = %vip.interface,
+                    error = %format!("{err:#}"),
+                    "attaching the VIP failed"
+                );
                 return false;
             }
         }
@@ -140,7 +145,12 @@ async fn detach_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> boo
             Ok(true) => tracing::info!(vip = %vip.ip, interface = %vip.interface, "VIP detached"),
             Ok(false) => {}
             Err(err) => {
-                tracing::error!(vip = %vip.ip, interface = %vip.interface, error = %format!("{err:#}"), "detaching the VIP failed; retrying in 2 s");
+                tracing::error!(
+                    vip = %vip.ip,
+                    interface = %vip.interface,
+                    error = %format!("{err:#}"),
+                    "detaching the VIP failed; retrying in 2 s"
+                );
                 ok = false;
             }
         }
