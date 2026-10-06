@@ -132,14 +132,9 @@ impl VipBackend for WindowsBackend {
                     }
                 }
                 AddressState::Missing => {
-                    // netsh also accepts an adapter index as `interface`, which the check's InterfaceAlias
-                    // filter cannot match. Failing would leave this node unable to ever hold the VIP.
-                    tracing::warn!(
-                        vip = %vip.ip,
-                        interface = %vip.interface,
-                        "the duplicate-address check did not find the VIP; keeping it (set `interface` to the adapter's name)"
-                    );
-                    return Ok(());
+                    // Config validation rejects an adapter index, which the InterfaceAlias filter could not
+                    // match, so a missing address means the attach really failed.
+                    anyhow::bail!("{} is not on {} after adding it", vip.ip, vip.interface)
                 }
                 other => {
                     tracing::warn!(vip = %vip.ip, state = ?other, "VIP attached but not yet Preferred");

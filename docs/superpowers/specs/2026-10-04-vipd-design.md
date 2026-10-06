@@ -304,7 +304,7 @@ How the gratuitous ARP is sent:
   - The script contains no double quotes, so Windows command-line quoting cannot change it. A `'` in the adapter name is doubled.
   - `Preferred`: done.
   - `Duplicate`: detach, wait 1 s and retry the attach, up to 3 attempts. After that, return an error, which the runtime turns into `AttachFailed`.
-  - Nothing printed: the check did not find the address, for example because `interface` is an adapter index, which `netsh` accepts but `InterfaceAlias` never equals. Keep the address, with the warning "the duplicate-address check did not find the VIP; keeping it".
+  - Nothing printed: the address is not on the adapter. Return an error, which the runtime turns into `AttachFailed`. Config validation rejects an adapter index, which `netsh` accepts but `InterfaceAlias` never equals.
   - The check cannot run (PowerShell fails to start, exits with an error or times out): keep the address, with the warning "cannot check the VIP for a duplicate address; keeping it". Windows still runs its own duplicate detection, so a broken PowerShell must not stop a node from ever holding the VIP.
   - Any other state, such as still `Tentative` after 3 s: keep the address, with a warning.
 - **Error hint.** When `netsh … add address` fails, the error adds a hint: if the adapter uses DHCP, run `netsh interface ipv4 set interface interface="<adapter>" dhcpstaticipcoexistence=enabled` once, or give it a static IP.
@@ -373,7 +373,7 @@ The default path is `/etc/vipd/vipd.toml` on Linux and `C:\ProgramData\vipd\vipd
 | `peers` | required | at least one `ip:port`; unique IPs; must not contain the `bind` IP; port not 0 |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn` or `error`; `RUST_LOG` overrides it |
 | `log_dir` | `C:\ProgramData\vipd\logs` | used by the Windows service only (§13) |
-| `[[vip]]` | at least one | `ip` (IPv4, required; a unique unicast address that is not the `bind` or a peer IP), `prefix` (1–32, default 32, the safe choice; see below), `interface` (required, must exist; on Linux also a valid interface name) |
+| `[[vip]]` | at least one | `ip` (IPv4, required; a unique unicast address that is not the `bind` or a peer IP), `prefix` (1–32, default 32, the safe choice; see below), `interface` (required, must exist; on Linux also a valid interface name; on Windows the adapter's name, not its index, without surrounding whitespace) |
 | `[[check]]` | none | see §8 |
 | `[hooks]` | none | see §9 |
 | `[vip_commands]` | none | see §7.4 |
@@ -519,7 +519,7 @@ On Linux, the `service` subcommands print an error that points to `packaging/vip
 8. An error exit restarts the service, both right after `service install` and after a reboot.
 9. The duplicate-address check runs, with no PowerShell quoting problems, and reports `Preferred` after an attach.
 10. `service uninstall` followed at once by `service install` works.
-11. An adapter index given as `interface` attaches, with the warning "the duplicate-address check did not find the VIP; keeping it".
+11. `check-config` rejects an adapter index given as `interface`, and accepts the adapter's name.
 12. Closing the console window of a foreground `vipd.exe run` leaves the VIP until vipd starts again, and start-up then removes it.
 13. The install steps from the README work: `icacls` leaves the config readable only by SYSTEM and Administrators, and the service starts from `C:\Program Files\vipd`.
 

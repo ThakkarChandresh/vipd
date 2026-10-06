@@ -347,8 +347,21 @@ fn interface_name_problem(name: &str) -> Option<&'static str> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn interface_name_problem(_name: &str) -> Option<&'static str> {
-    None
+fn interface_name_problem(name: &str) -> Option<&'static str> {
+    windows_interface_name_problem(name)
+}
+
+/// netsh also accepts an adapter index, or a name with spaces around it, but the duplicate-address
+/// check (src/vip/windows.rs) matches the adapter's name exactly.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn windows_interface_name_problem(name: &str) -> Option<&'static str> {
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        Some("is an adapter index; use the adapter's name")
+    } else if name.trim() != name {
+        Some("has leading or trailing whitespace")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -548,5 +561,12 @@ weight = 300
     fn a_missing_vip_section_is_rejected() {
         let text = MINIMAL.split("[[vip]]").next().unwrap();
         assert!(matches!(Config::from_toml(text), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn windows_interfaces_must_be_adapter_names() {
+        assert_eq!(windows_interface_name_problem("Ethernet 2"), None);
+        assert_eq!(windows_interface_name_problem("12"), Some("is an adapter index; use the adapter's name"));
+        assert_eq!(windows_interface_name_problem(" Ethernet"), Some("has leading or trailing whitespace"));
     }
 }
