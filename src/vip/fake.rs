@@ -23,6 +23,7 @@ struct Inner {
     panic_attach: AtomicBool,
     detach_delay_ms: AtomicU64,
     attach_delay_ms: AtomicU64,
+    missing_interface: Mutex<Option<String>>,
 }
 
 impl FakeBackend {
@@ -62,17 +63,30 @@ impl FakeBackend {
         self.inner.panic_attach.store(panic, Ordering::SeqCst);
     }
 
+    /// Makes this interface missing: `interface_exists` says so, and `find` fails on it, as with the
+    /// real backends.
+    pub fn set_missing_interface(&self, iface: &str) {
+        *self.inner.missing_interface.lock().unwrap() = Some(iface.to_string());
+    }
+
+    fn is_missing(&self, iface: &str) -> bool {
+        self.inner.missing_interface.lock().unwrap().as_deref() == Some(iface)
+    }
+
     fn record(&self, call: String) {
         self.inner.calls.lock().unwrap().push(call);
     }
 }
 
 impl VipBackend for FakeBackend {
-    async fn interface_exists(&self, _iface: &str) -> anyhow::Result<bool> {
-        Ok(true)
+    async fn interface_exists(&self, iface: &str) -> anyhow::Result<bool> {
+        Ok(!self.is_missing(iface))
     }
 
     async fn find(&self, vip: &Vip) -> anyhow::Result<Option<String>> {
+        if self.is_missing(&vip.interface) {
+            anyhow::bail!("simulated missing interface {}", vip.interface);
+        }
         Ok(self.is_attached(vip.ip).then(|| format!("{}/{}", vip.ip, vip.prefix)))
     }
 

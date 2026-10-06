@@ -422,8 +422,8 @@ on_master = "/usr/local/bin/vip-alert.sh master"
 ### 11.1 Start-up sequence
 
 1. Load and validate the config. On error, exit with code **2**.
-2. Check that every VIP's interface exists (§10). If one does not, exit with code 1.
-3. Run `detach` for every configured VIP, cleaning up after a crash. If this fails, exit with code 1, because the node is not safe to run.
+2. Check that every VIP's interface exists (§10). If one does not, step 3 still runs, and then vipd exits with code 1 and this error. Otherwise one missing interface would leave the VIPs that a crash left on the other interfaces next to the peer's, while the service manager restarts vipd again and again.
+3. Run `detach` for every configured VIP, cleaning up after a crash. A VIP that cannot be detached does not stop the others from being tried. If any fails, exit with code 1, because the node is not safe to run.
 4. Bind the UDP socket. If this fails, exit with code 1. Binding only after step 3 means that a socket that cannot be bound, because the port is taken or the `bind` IP is gone, does not skip the cleanup.
 5. Run the first round of checks and compute `Health`.
 6. Create the `Machine` and feed it `Started { health }`.

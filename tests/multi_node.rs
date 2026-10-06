@@ -166,6 +166,21 @@ async fn start_up_removes_a_leftover_vip_or_refuses_to_run() {
     assert!(format!("{err:#}").contains("cannot remove leftover VIP"), "{err:#}");
 }
 
+#[tokio::test]
+async fn start_up_removes_leftover_vips_even_when_an_interface_is_missing() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 141), Ipv4Addr::new(127, 0, 0, 142)]);
+    let other_vip = Ipv4Addr::new(10, 99, 0, 2);
+    let cfg = config_with(addrs[0], &[addrs[1]], 100, &format!("[[vip]]\nip = \"{other_vip}\"\ninterface = \"fake1\""));
+    let fake = FakeBackend::new();
+    // The first VIP's interface is missing, so the cleanup fails on that VIP before it gets to the
+    // leftover one.
+    fake.set_missing_interface("fake0");
+    fake.attach(&cfg.vips[1]).await.unwrap(); // left over from a crash
+    let err = runtime::run(cfg, fake.clone(), std::future::pending()).await.unwrap_err();
+    assert!(format!("{err:#}").contains(&format!("\"fake0\" (for VIP {VIP}) does not exist")), "{err:#}");
+    assert!(!fake.is_attached(other_vip), "the leftover VIP on the other interface stays");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_failing_check_hands_the_vip_to_the_peer_and_hooks_run() {

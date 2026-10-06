@@ -39,27 +39,26 @@ pub async fn run<B: VipBackend>(
 
     // A stop cuts the interface check short; leftover VIPs are still removed below. Polling
     // `shutdown` here also installs its signal handlers before the slower steps.
-    let mut stopping = tokio::select! {
+    let (mut stopping, checked) = tokio::select! {
         biased;
-        () = &mut shutdown => true,
-        checked = check_interfaces(&cfg, &manager) => {
-            checked?;
-            false
-        }
+        () = &mut shutdown => (true, Ok(())),
+        checked = check_interfaces(&cfg, &manager) => (false, checked),
     };
-    // Leftover VIPs are always removed, even if a stop arrives meanwhile: the peer may already hold
-    // them.
-    {
+    // Leftover VIPs are always removed, even if an interface is missing or a stop arrives meanwhile:
+    // the peer may already hold them.
+    let cleaned = {
         let cleanup = remove_leftover_vips(&cfg, &manager);
         tokio::pin!(cleanup);
         loop {
             tokio::select! {
                 biased;
                 () = &mut shutdown, if !stopping => stopping = true,
-                cleaned = &mut cleanup => break cleaned?,
+                cleaned = &mut cleanup => break cleaned,
             }
         }
-    }
+    };
+    // A missing interface is reported before a failed removal, which it may well have caused.
+    checked.and(cleaned)?;
     if stopping {
         return Ok(());
     }
@@ -193,12 +192,16 @@ async fn check_interfaces<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) 
     Ok(())
 }
 
-/// Removes VIPs left over from a crash, so a node never starts out holding one (spec §11.1).
+/// Removes VIPs left over from a crash, so a node never starts out holding one (spec §11.1). Tries
+/// every VIP, even after one fails, and returns the first error.
 async fn remove_leftover_vips<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> anyhow::Result<()> {
+    let mut result = Ok(());
     for vip in &cfg.vips {
-        manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip))?;
+        let removed =
+            manager.ensure_detached(vip).await.with_context(|| format!("cannot remove leftover VIP {}", vip.ip));
+        result = result.and(removed.map(|_| ())); // keeps the first error
     }
-    Ok(())
+    result
 }
 
 /// The first round of checks, all at once, before the election starts (spec §8).
