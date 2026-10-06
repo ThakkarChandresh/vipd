@@ -180,6 +180,9 @@ struct RawCommands {
 
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
+/// The published `auth_key` in examples/vipd.toml, which anyone could use to forge heartbeats.
+const EXAMPLE_AUTH_KEY: &str = "a-long-random-shared-secret";
+
 impl RawConfig {
     /// Checks every rule and reports all problems at once.
     fn validate(self) -> Result<Config, ConfigError> {
@@ -206,6 +209,12 @@ impl RawConfig {
         if self.auth_key.trim().len() != self.auth_key.len() {
             problems.push("auth_key must not start or end with whitespace".to_string());
         }
+        if &*self.auth_key == EXAMPLE_AUTH_KEY {
+            problems.push(
+                "auth_key is the example key from examples/vipd.toml; replace it with your own random secret"
+                    .to_string(),
+            );
+        }
         if self.bind.ip().is_unspecified() {
             problems.push("bind must use this node's real IP, not 0.0.0.0".to_string());
         }
@@ -229,6 +238,10 @@ impl RawConfig {
         }
         if !LOG_LEVELS.contains(&self.log_level.as_str()) {
             problems.push(format!("log_level must be one of {} (got {:?})", LOG_LEVELS.join(", "), self.log_level));
+        }
+        // A Windows service starts in System32, so a relative log_dir would write, and prune old logs, there.
+        if cfg!(windows) && self.log_dir.as_ref().is_some_and(|d| !d.is_absolute()) {
+            problems.push("log_dir must be an absolute path, such as 'D:\\vipd\\logs'".to_string());
         }
 
         if self.vips.is_empty() {
@@ -548,6 +561,12 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
                 other => panic!("{case}: expected a parse error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn the_example_auth_key_is_rejected() {
+        let p = problems(&MINIMAL.replace("0123456789abcdef", "a-long-random-shared-secret"));
+        assert_eq!(p, ["auth_key is the example key from examples/vipd.toml; replace it with your own random secret"]);
     }
 
     #[test]

@@ -372,11 +372,11 @@ The default path is `/etc/vipd/vipd.toml` on Linux and `C:\ProgramData\vipd\vipd
 | `priority` | required | 1–254 |
 | `preempt` | `true` | |
 | `advert_interval_ms` | 1000 | 50–60000; should match on all nodes (a mismatch is warned about) |
-| `auth_key` | required | ≥ 16 characters, no leading or trailing whitespace; same on all nodes |
+| `auth_key` | required | ≥ 16 characters, no leading or trailing whitespace, not the example key from `examples/vipd.toml`; same on all nodes |
 | `bind` | required | `ip:port`. The IPv4 address must not be `0.0.0.0`, because it is needed for tie-breaks, and the port must not be 0. |
 | `peers` | required | at least one `ip:port`; unique IPs; must not contain the `bind` IP; port not 0 |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn` or `error`; `RUST_LOG` overrides it |
-| `log_dir` | `C:\ProgramData\vipd\logs` | used by the Windows service only (§13) |
+| `log_dir` | `C:\ProgramData\vipd\logs` | an absolute path; used by the Windows service only (§13) |
 | `[[vip]]` | at least one | `ip` (IPv4, required; a unique unicast address that is not the `bind` or a peer IP), `prefix` (1–32, default 32, the safe choice; see below), `interface` (required, must exist; on Linux also a valid interface name; on Windows the adapter's name, not its index, without surrounding whitespace) |
 | `[[check]]` | none | see §8 |
 | `[hooks]` | none | see §9 |
@@ -385,7 +385,7 @@ The default path is `/etc/vipd/vipd.toml` on Linux and `C:\ProgramData\vipd\vipd
 How "the interface exists" is checked:
 - **Linux:** `/sys/class/net/{iface}` exists.
 - **Windows:** `netsh interface ipv4 show interfaces "{iface}"` exits with code 0.
-- `vipd check-config` reports a missing interface as an invalid config (exit code 2). `vipd run` checks at start-up (§11.1) and exits with code 1.
+- `vipd check-config` reports a missing interface, or a `bind` address this machine does not have, as an invalid config (exit code 2). `vipd run` checks the interfaces at start-up (§11.1) and exits with code 1.
 
 **VIP prefix.** Keep the default `/32`, which is the safe choice. On Linux, a VIP with the same prefix length as the interface's own address (say `/24`) becomes a secondary address, and the kernel deletes it whenever the primary address is removed, for example by a DHCP change. A subnet prefix needs `net.ipv4.conf.<interface>.promote_secondaries=1` as well.
 
@@ -478,7 +478,7 @@ A single task that owns the backend and processes requests in order, skipping th
 | Command | Purpose |
 |---|---|
 | `vipd run [--config PATH]` | Run in the foreground. SIGTERM, SIGHUP, SIGINT and Ctrl+C trigger a graceful stop; a SIGHUP that is already ignored at start (`nohup`) stays ignored. |
-| `vipd check-config [--config PATH]` | Validate the config, including that every VIP's interface exists, and exit with 0 (valid) or 2 (invalid) |
+| `vipd check-config [--config PATH]` | Validate the config, including that every VIP's interface exists and that `bind` is an address of this machine, and exit with 0 (valid) or 2 (invalid) |
 | `vipd service install [--config PATH]` | Windows only. Refuses an invalid config. Registers the service `vipd`, which runs this `vipd.exe` with the config's absolute path: automatic start, LocalSystem, a 25 s pre-shutdown timeout (§13), and restart on failure after 5 s, then 5 s, then every 60 s. Error exits count as failures, not only crashes. The failure count resets after a day without failures. |
 | `vipd service uninstall` | Windows only. Stops the service, waiting up to 60 s, then deletes it, so an install right after works. |
 | `vipd service run --config PATH` | Windows only. The entry point the Service Control Manager calls; users don't run it. |

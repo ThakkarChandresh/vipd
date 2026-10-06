@@ -23,7 +23,7 @@ Copy [examples/vipd.toml](examples/vipd.toml) to every node.
 
 - **Change on each node:** `node_name`, `priority`, `bind`, `peers` and the VIP's `interface` (on Windows the adapter's name, as `Get-NetAdapter` shows it, not its index).
 - **Keep identical on all nodes:** `group_id`, `auth_key`, `advert_interval_ms` and the VIP list.
-- **Replace the example `auth_key`** with your own random secret, for example from `openssl rand -base64 32`. Anyone who knows it can forge heartbeats.
+- **Replace the example `auth_key`** with your own random secret, for example from `openssl rand -base64 32`. Anyone who knows it can forge heartbeats. vipd refuses to start with the example key.
 - **Firewall:** allow UDP port 8458 (or your `bind` port) between the nodes.
 - **VIP prefix:** keep the default `/32`. On Linux, a VIP with the same prefix length as the interface's own address (say `/24`) becomes a secondary address, and the kernel deletes it whenever the primary address is removed, for example by a DHCP change. If you need the subnet prefix, also set `net.ipv4.conf.<interface>.promote_secondaries=1`.
 - **Windows paths:** write them in single quotes, which TOML reads literally: `log_dir = 'D:\vipd\logs'`. In double quotes, `\t`, `\n` and the like silently become control characters. The same goes for check and hook commands.
@@ -75,7 +75,7 @@ sc.exe start vipd
 
 The service runs the `vipd.exe` it was installed from, so keep it in a folder only administrators can change, such as `C:\Program Files\vipd`. The `icacls` line lets only SYSTEM and Administrators read the config, which holds `auth_key`, and write the logs.
 
-- **Logs:** `C:\ProgramData\vipd\logs\vipd.YYYY-MM-DD.log`, one file per day (UTC). vipd keeps the newest 14 `vipd*.log` files in that directory and deletes older ones, so keep other files out of it. Set `log_dir` to move it, preferably to a local disk.
+- **Logs:** `C:\ProgramData\vipd\logs\vipd.YYYY-MM-DD.log`, one file per day (UTC). vipd keeps the newest 14 `vipd*.log` files in that directory and deletes older ones, so keep other files out of it. Set `log_dir` to an absolute path to move it, preferably on a local disk.
 - **Restarts:** after a failure, including an invalid config, Windows restarts vipd after 5 s, then 5 s, then every minute. To stop a restart loop, run `sc.exe config vipd start= disabled`; after fixing the cause, run `sc.exe config vipd start= auto` and `sc.exe start vipd`.
 - **Errors:** a failed vipd leaves a Service Control Manager event (ID 7024) in the System log with its exit code as a "service-specific error". Event Viewer words that code as an unrelated Windows message: "Incorrect function." means 1, a runtime failure, and "The system cannot find the file specified." means 2, an invalid config. The vipd log has the details.
 - **Shutdown:** when Windows shuts down, vipd hands the VIP over before other services stop.

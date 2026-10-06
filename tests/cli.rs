@@ -52,6 +52,19 @@ fn check_config_rejects_a_missing_interface_with_exit_code_2() {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn check_config_rejects_a_bind_address_this_machine_does_not_have() {
+    let path = config_file("foreign-bind", "lo");
+    // 192.0.2.0/24 is TEST-NET-1, never a local address.
+    let text = std::fs::read_to_string(&path).unwrap().replace("127.0.0.1:18458", "192.0.2.13:18458");
+    std::fs::write(&path, text).unwrap();
+    let out = vipd(&["check-config", "--config", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("is not an address of this machine"), "{}", stderr(&out));
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn check_config_rejects_a_missing_file_with_exit_code_2() {
     let missing = std::env::temp_dir().join("vipd-cli-test-no-such-file.toml");

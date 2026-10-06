@@ -52,7 +52,7 @@ fn check_config(path: &Path) -> ExitCode {
         Err(code) => return code,
     };
     let backend = PlatformBackend::new();
-    let problems: Vec<String> = tokio_runtime().block_on(async {
+    let mut problems: Vec<String> = tokio_runtime().block_on(async {
         let mut problems = Vec::new();
         for vip in &config.vips {
             match backend.interface_exists(&vip.interface).await {
@@ -66,6 +66,11 @@ fn check_config(path: &Path) -> ExitCode {
         }
         problems
     });
+    // A config copied from another node would otherwise pass here, and only `run` would fail to bind. Port 0,
+    // so a running vipd, which holds the configured port, does not cause a false alarm.
+    if let Err(err) = std::net::UdpSocket::bind((*config.bind.ip(), 0)) {
+        problems.push(format!("bind {} is not an address of this machine: {err}", config.bind.ip()));
+    }
     if problems.is_empty() {
         println!("{}: OK", path.display());
         ExitCode::SUCCESS
