@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Cross-platform virtual IP failover daemon"
+repository = "https://github.com/ThakkarChandresh/vipd"
+publish = false
 
 [dependencies]
 anyhow = "1"

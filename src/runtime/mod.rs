@@ -102,6 +102,7 @@ pub async fn run<B: VipBackend>(
     let mut buf = [0u8; 2 * PACKET_LEN];
     loop {
         let deadline = machine.next_deadline();
+        // Unbiased on purpose: with `biased;` a flood of packets could starve the timer and shutdown branches.
         let event = tokio::select! {
             () = &mut shutdown => break,
             received = node.socket.recv_from(&mut buf) => match received {
@@ -169,7 +170,10 @@ pub async fn run<B: VipBackend>(
     let flushed = flush_worker(&node.vip_tx).await;
     if let Some(stop_hook) = node.stop_hook.take() {
         if tokio::time::timeout(STOP_HOOK_TIMEOUT, stop_hook).await.is_err() {
-            tracing::warn!("on_stop is still running after 5 s; it is stopped as vipd exits");
+            tracing::warn!(
+                "on_stop is still running after {} s; it is stopped as vipd exits",
+                STOP_HOOK_TIMEOUT.as_secs()
+            );
         }
     }
     // Returning lets the runtime drop every task that is still running, and dropping a command's
@@ -220,7 +224,7 @@ async fn flush_worker(vip_tx: &mpsc::UnboundedSender<VipRequest>) -> anyhow::Res
     match tokio::time::timeout(WORKER_FLUSH_TIMEOUT, flushed).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => anyhow::bail!("the VIP worker stopped before the VIPs were removed"),
-        Err(_) => anyhow::bail!("the VIPs were still not removed after 15 s"),
+        Err(_) => anyhow::bail!("the VIPs were still not removed after {} s", WORKER_FLUSH_TIMEOUT.as_secs()),
     }
 }
 

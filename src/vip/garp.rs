@@ -97,6 +97,7 @@ mod tests {
     #[test]
     fn parses_mac_addresses() {
         assert_eq!(parse_mac("aa:bb:cc:00:11:ff\n"), Some([0xaa, 0xbb, 0xcc, 0x00, 0x11, 0xff]));
+        assert_eq!(parse_mac("AA:BB:CC:0:1:F"), Some([0xaa, 0xbb, 0xcc, 0x00, 0x01, 0x0f]));
         assert_eq!(parse_mac("aa:bb:cc:00:11"), None);
         assert_eq!(parse_mac("aa:bb:cc:00:11:ff:00"), None);
         assert_eq!(parse_mac("zz:bb:cc:00:11:ff"), None);
@@ -109,6 +110,7 @@ mod tests {
         assert_eq!(&frame[0..6], &[0xff; 6]);
         assert_eq!(&frame[6..12], &mac);
         assert_eq!(&frame[12..14], &[0x08, 0x06]);
+        assert_eq!(&frame[14..20], &[0x00, 0x01, 0x08, 0x00, 6, 4]);
         assert_eq!(&frame[20..22], &[0x00, 0x01]);
         assert_eq!(&frame[22..28], &mac);
         assert_eq!(&frame[28..32], &[192, 168, 1, 200]);

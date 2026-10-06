@@ -447,6 +447,13 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
     }
 
     #[test]
+    fn a_duplicate_vip_ip_is_rejected() {
+        let text = format!("{MINIMAL}\n[[vip]]\nip = \"192.168.1.200\"\ninterface = \"eth1\"\n");
+        let p = problems(&text);
+        assert!(p.iter().any(|m| m.contains("vip 192.168.1.200 is listed more than once")), "{p:?}");
+    }
+
+    #[test]
     fn every_rule_names_the_bad_setting() {
         let cases = [
             ("group_id = 51", "group_id = 0", "group_id"),
@@ -482,6 +489,13 @@ attach = "ip addr add {{ip}}/{{prefix}} dev {{iface}}"
             let p = problems(&check(extra));
             assert!(p.iter().any(|m| m.contains(expected)), "{extra}: {p:?}");
         }
+    }
+
+    #[test]
+    fn an_empty_check_name_is_rejected() {
+        let text = format!("{MINIMAL}\n[[check]]\nname = \"\"\ncommand = \"true\"\n");
+        let p = problems(&text);
+        assert!(p.iter().any(|m| m.contains("every [[check]] needs a name")), "{p:?}");
     }
 
     #[test]

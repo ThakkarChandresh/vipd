@@ -22,6 +22,13 @@ mod tests {
     }
 
     #[test]
+    fn skew_at_the_priority_limits() {
+        assert_eq!(skew(0, Duration::from_secs(1)), Duration::from_secs(1));
+        assert_eq!(skew(254, Duration::from_secs(1)), Duration::from_nanos(7_812_500));
+        assert_eq!(skew(255, Duration::from_secs(1)), Duration::from_nanos(3_906_250));
+    }
+
+    #[test]
     fn higher_priority_has_shorter_skew() {
         let interval = Duration::from_secs(1);
         assert!(skew(150, interval) < skew(100, interval));

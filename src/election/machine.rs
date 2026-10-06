@@ -290,6 +290,8 @@ impl Machine {
         self.arm_down(now);
     }
 
+    // Timers re-arm from the `now` of the event being handled, not from the old deadline, so a late
+    // TimerFired delays the next one instead of bunching two together.
     fn send_advert(&mut self, now: Instant, actions: &mut Vec<Action>) {
         actions.push(Action::SendHeartbeat { priority: self.mine() });
         self.advert_at = Some(now + self.cfg.advert_interval);
@@ -577,6 +579,11 @@ mod tests {
         let (mut m, t0) = backup(100);
         assert!(m.handle(Event::AttachFailed, t0).is_empty());
         assert_eq!(m.state(), State::Backup);
+
+        let (mut m, t) = master(100);
+        m.handle(Event::HealthChanged(faulty(100)), t);
+        assert!(m.handle(Event::AttachFailed, t).is_empty());
+        assert_eq!(m.state(), State::Fault);
     }
 
     #[test]
@@ -594,5 +601,31 @@ mod tests {
     fn shutdown_from_backup_only_runs_the_stop_hook() {
         let (mut m, t0) = backup(100);
         assert_eq!(m.handle(Event::Shutdown, t0), vec![Action::RunHook(HookKind::Stop)]);
+    }
+
+    #[test]
+    fn shutdown_from_fault_only_runs_the_stop_hook() {
+        let (mut m, t) = master(100);
+        m.handle(Event::HealthChanged(faulty(100)), t);
+        assert_eq!(m.state(), State::Fault);
+        assert_eq!(m.handle(Event::Shutdown, t + SEC), vec![Action::RunHook(HookKind::Stop)]);
+        assert_eq!(m.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_heartbeat_at_the_down_deadline_wins_in_either_order() {
+        // Heartbeat first: it re-arms the down timer, so the timer that fires next does nothing.
+        let (mut m, _) = backup(100);
+        let due = m.next_deadline().unwrap();
+        assert!(m.handle(hb(LOWER_IP, 150), due).is_empty());
+        assert!(m.handle(Event::TimerFired, due).is_empty());
+        assert_eq!(m.state(), State::Backup);
+        // Timer first: the node takes over, then steps down at once for the higher priority.
+        let (mut m, _) = backup(100);
+        let due = m.next_deadline().unwrap();
+        m.handle(Event::TimerFired, due);
+        assert_eq!(m.state(), State::Master);
+        assert_eq!(m.handle(hb(LOWER_IP, 150), due), vec![Action::DetachVips, Action::RunHook(HookKind::Backup)]);
+        assert_eq!(m.state(), State::Backup);
     }
 }

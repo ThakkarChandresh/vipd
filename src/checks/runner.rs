@@ -39,6 +39,8 @@ pub async fn run_once(spec: &CheckSpec) -> bool {
 
 /// Runs the check every `interval`, starting one interval from now, and reports each result.
 /// A tick that arrives while the previous run is still going is skipped.
+/// `spec.interval` must not be zero (tokio's interval panics on it); config validation keeps it at
+/// 100 ms or more.
 pub fn spawn_check_loop(index: usize, spec: CheckSpec, results: mpsc::Sender<CheckResult>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let first = tokio::time::Instant::now() + spec.interval;

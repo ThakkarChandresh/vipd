@@ -18,6 +18,8 @@ pub struct CheckState {
 }
 
 impl CheckState {
+    /// `fall` failures in a row turn `Ok` into `Failing`, and `rise` passes in a row turn `Failing`
+    /// into `Ok`; 0 counts as 1. The first result decides the initial status on its own.
     pub fn new(fall: u32, rise: u32) -> Self {
         Self { status: CheckStatus::Unknown, streak: 0, fall: fall.max(1), rise: rise.max(1) }
     }
@@ -61,8 +63,8 @@ pub fn aggregate(base: u8, checks: &[(i32, CheckStatus)]) -> Health {
     for &(weight, status) in checks {
         match (weight, status) {
             (0, CheckStatus::Failing) => fault = true,
-            (w, CheckStatus::Failing) if w < 0 => sum += w,
-            (w, CheckStatus::Ok) if w > 0 => sum += w,
+            (w, CheckStatus::Failing) if w < 0 => sum = sum.saturating_add(w),
+            (w, CheckStatus::Ok) if w > 0 => sum = sum.saturating_add(w),
             _ => {}
         }
     }
@@ -106,6 +108,27 @@ mod tests {
     }
 
     #[test]
+    fn a_result_that_agrees_with_the_status_restarts_the_streak() {
+        let mut check = CheckState::new(1, 2);
+        check.record(false);
+        assert!(!check.record(true));
+        assert!(!check.record(false)); // still Failing, and the rise count starts over
+        assert!(!check.record(true));
+        assert!(check.record(true));
+        assert_eq!(check.status(), CheckStatus::Ok);
+    }
+
+    #[test]
+    fn zero_fall_and_rise_act_like_one() {
+        let mut check = CheckState::new(0, 0);
+        check.record(true);
+        assert!(check.record(false));
+        assert_eq!(check.status(), CheckStatus::Failing);
+        assert!(check.record(true));
+        assert_eq!(check.status(), CheckStatus::Ok);
+    }
+
+    #[test]
     fn a_negative_weight_applies_while_failing() {
         assert_eq!(aggregate(150, &[(-60, CheckStatus::Failing)]), Health { effective_priority: 90, fault: false });
         assert_eq!(aggregate(150, &[(-60, CheckStatus::Ok)]).effective_priority, 150);
@@ -115,6 +138,12 @@ mod tests {
     fn a_positive_weight_applies_while_passing() {
         assert_eq!(aggregate(100, &[(20, CheckStatus::Ok)]).effective_priority, 120);
         assert_eq!(aggregate(100, &[(20, CheckStatus::Failing)]).effective_priority, 100);
+    }
+
+    #[test]
+    fn every_contributing_check_counts() {
+        let checks = [(-30, CheckStatus::Failing), (10, CheckStatus::Ok), (0, CheckStatus::Ok)];
+        assert_eq!(aggregate(100, &checks), Health { effective_priority: 80, fault: false });
     }
 
     #[test]
