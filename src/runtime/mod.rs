@@ -35,7 +35,6 @@ pub async fn run<B: VipBackend>(
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     tokio::pin!(shutdown);
-    let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     let manager = Arc::new(VipManager::new(backend, cfg.vip_commands.clone()));
 
     // A stop cuts the interface check short; leftover VIPs are still removed below. Polling
@@ -64,6 +63,7 @@ pub async fn run<B: VipBackend>(
     if stopping {
         return Ok(());
     }
+    let socket = UdpSocket::bind(cfg.bind).await.with_context(|| format!("cannot bind UDP {}", cfg.bind))?;
     // A stop during the first round of checks just stops: nothing is held yet.
     let mut check_states = tokio::select! {
         biased;
@@ -134,7 +134,9 @@ pub async fn run<B: VipBackend>(
                 }
             },
             worker_event = worker_events.recv() => match worker_event {
-                Some(WorkerEvent::AttachFailed) => Some(Event::AttachFailed),
+                // Only the newest attach counts. An older one belongs to a term this node has since
+                // left, and the attach queued after it may still succeed.
+                Some(WorkerEvent::AttachFailed(id)) => (id == node.last_attach).then_some(Event::AttachFailed),
                 // The worker only stops this early if it panicked. Without it no VIP can move, so
                 // exit and let the service manager restart vipd; start-up removes any leftover VIP.
                 None => anyhow::bail!("the VIP worker stopped unexpectedly"),
@@ -272,6 +274,8 @@ struct Node {
     vip_tx: mpsc::UnboundedSender<VipRequest>,
     hooks: HookCommands,
     stop_hook: Option<JoinHandle<()>>,
+    /// The number of the newest attach request.
+    last_attach: u64,
 }
 
 impl Node {
@@ -295,6 +299,7 @@ impl Node {
             vip_tx,
             hooks: cfg.hooks.clone(),
             stop_hook: None,
+            last_attach: 0,
         }
     }
 
@@ -359,7 +364,10 @@ impl Node {
         for action in actions {
             match action {
                 Action::SendHeartbeat { priority } => self.send_heartbeat(priority).await,
-                Action::AttachVips => self.request(VipRequest::Attach),
+                Action::AttachVips => {
+                    self.last_attach += 1;
+                    self.request(VipRequest::Attach(self.last_attach));
+                }
                 Action::DetachVips => self.request(VipRequest::Detach),
                 Action::Announce => self.request(VipRequest::Announce),
                 Action::RunHook(kind) => {
@@ -445,5 +453,35 @@ interface = "fake0"
             node.receive_failed(&std::io::Error::other("boom"));
         }
         assert_eq!(node.warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_for_another_group_is_dropped_before_the_replay_check() {
+        let mut node = test_node().await;
+        let codec = Codec::new(b"0123456789abcdef"); // test_node's auth_key, so the HMAC passes
+        let peer = Ipv4Addr::new(127, 0, 0, 2);
+        let from = SocketAddr::from((peer, 8458));
+        let packet = |group_id: u16, seq: u64| {
+            codec.encode(&Heartbeat { group_id, priority: 200, interval_ms: 1000, vip_fingerprint: 0, boot_id: 1, seq })
+        };
+        // test_node is group 1, so group 2 is dropped...
+        assert_eq!(node.heartbeat_event(&packet(2, 5), from), None);
+        // ...without reaching the replay guard: seq 1 of the same run is still accepted.
+        let accepted = Event::Heartbeat { from: peer, priority: 200, interval: Duration::from_secs(1) };
+        assert_eq!(node.heartbeat_event(&packet(1, 1), from), Some(accepted));
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_carries_the_peer_interval_and_a_replay_is_dropped() {
+        let mut node = test_node().await;
+        let codec = Codec::new(b"0123456789abcdef"); // test_node's auth_key, so the HMAC passes
+        let peer = Ipv4Addr::new(127, 0, 0, 2);
+        let from = SocketAddr::from((peer, 8458));
+        // The peer advertises every 2 s; this node's own interval is 1 s.
+        let hb = Heartbeat { group_id: 1, priority: 200, interval_ms: 2000, vip_fingerprint: 0, boot_id: 1, seq: 5 };
+        let packet = codec.encode(&hb);
+        let event = Event::Heartbeat { from: peer, priority: 200, interval: Duration::from_secs(2) };
+        assert_eq!(node.heartbeat_event(&packet, from), Some(event));
+        assert_eq!(node.heartbeat_event(&packet, from), None, "the same packet again is a replay");
     }
 }

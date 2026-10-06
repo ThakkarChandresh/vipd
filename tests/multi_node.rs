@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use vipd::config::Config;
-use vipd::proto::Codec;
+use vipd::proto::{Codec, Heartbeat};
 use vipd::runtime;
 use vipd::vip::fake::FakeBackend;
 use vipd::vip::VipBackend;
@@ -319,4 +319,113 @@ async fn a_dead_vip_worker_stops_the_node() {
     let result = tokio::time::timeout(Duration::from_secs(5), node).await.expect("the node stops by itself");
     let err = result.expect_err("a dead VIP worker is fatal");
     assert!(err.to_string().contains("VIP worker"), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_late_attach_failure_from_an_earlier_term_does_not_fault_the_new_master() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 101), Ipv4Addr::new(127, 0, 0, 102)]);
+    // A plain socket plays the peer, so the test decides exactly when it is master.
+    let peer = UdpSocket::bind(addrs[1]).await.unwrap();
+    let fake = FakeBackend::new();
+    fake.set_attach_delay(Duration::from_millis(500));
+    fake.set_fail_attach(true);
+    let node = Node::start_with(config(addrs[0], &[addrs[1]], 100), fake.clone());
+    let attaches = |f: &FakeBackend| f.calls().iter().filter(|c| c.starts_with("attach")).count();
+    wait_until("the first attach starts", || attaches(&fake) == 1).await;
+
+    // While that attach runs, a higher master appears and then says goodbye: the node steps down
+    // and becomes master again, so a second attach is queued behind the first.
+    let codec = Codec::new(KEY.as_bytes());
+    let heartbeat = |priority, seq| {
+        codec.encode(&Heartbeat { group_id: 7, priority, interval_ms: 50, vip_fingerprint: 0, boot_id: 1, seq })
+    };
+    peer.send_to(&heartbeat(200, 1), addrs[0]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    peer.send_to(&heartbeat(0, 2), addrs[0]).await.unwrap();
+
+    // The first attach fails; the second, for the new term, succeeds.
+    wait_until("the second attach starts", || attaches(&fake) == 2).await;
+    fake.set_fail_attach(false);
+    wait_until("the node holds the VIP", || node.holds_vip()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(node.holds_vip(), "the first term's failure was charged to the second term");
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn a_slow_backend_does_not_replay_a_backlog_after_the_election_settles() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 111), Ipv4Addr::new(127, 0, 0, 112)]);
+    // A plain socket plays the peer, so the test decides exactly when it is master.
+    let peer = UdpSocket::bind(addrs[1]).await.unwrap();
+    let fake = FakeBackend::new();
+    fake.set_attach_delay(Duration::from_millis(300));
+    fake.set_detach_delay(Duration::from_millis(300));
+    let node = Node::start_with(config(addrs[0], &[addrs[1]], 100), fake.clone());
+    wait_until("the node holds the VIP", || node.holds_vip()).await;
+
+    let codec = Codec::new(KEY.as_bytes());
+    let mut seq = 0;
+    let mut packet = |priority| {
+        seq += 1;
+        codec.encode(&Heartbeat { group_id: 7, priority, interval_ms: 50, vip_fingerprint: 0, boot_id: 1, seq })
+    };
+    // For 2 s the peer takes over and says goodbye about every 100 ms, so the node steps down and
+    // takes over again each time, much faster than its backend can follow.
+    let flapping_ends = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < flapping_ends {
+        peer.send_to(&packet(200), addrs[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        peer.send_to(&packet(0), addrs[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    // Then the peer stays master, so the node is a backup and should let go within one detach.
+    let mut held = 0;
+    for _ in 0..100 {
+        peer.send_to(&packet(200), addrs[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        held += usize::from(node.holds_vip());
+    }
+    assert!(held <= 10, "as a backup the node still held the VIP in {held} of 100 samples over 5 s");
+    node.crash();
+}
+
+#[tokio::test]
+async fn a_failed_bind_still_removes_a_leftover_vip() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 121), Ipv4Addr::new(127, 0, 0, 122)]);
+    let _squatter = UdpSocket::bind(addrs[0]).await.unwrap(); // something else holds the port
+    let cfg = config(addrs[0], &[addrs[1]], 100);
+    let fake = FakeBackend::new();
+    fake.attach(&cfg.vips[0]).await.unwrap(); // left over from a crash
+    let err = runtime::run(cfg, fake.clone(), std::future::pending()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("cannot bind"), "{err:#}");
+    assert!(!fake.is_attached(VIP), "vipd cannot start, and the leftover VIP stays on this node");
+}
+
+#[tokio::test]
+async fn a_clean_stop_is_not_stuck_behind_a_backlog() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 131), Ipv4Addr::new(127, 0, 0, 132)]);
+    let peer = UdpSocket::bind(addrs[1]).await.unwrap();
+    let fake = FakeBackend::new();
+    fake.set_attach_delay(Duration::from_millis(300));
+    fake.set_detach_delay(Duration::from_millis(300));
+    let node = Node::start_with(config(addrs[0], &[addrs[1]], 100), fake.clone());
+    wait_until("the node holds the VIP", || node.holds_vip()).await;
+    let codec = Codec::new(KEY.as_bytes());
+    let mut seq = 0;
+    let mut packet = |priority| {
+        seq += 1;
+        codec.encode(&Heartbeat { group_id: 7, priority, interval_ms: 50, vip_fingerprint: 0, boot_id: 1, seq })
+    };
+    // 4 s of flapping queues about 24 s of backend work, more than the 15 s a stop waits for it.
+    let flapping_ends = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < flapping_ends {
+        peer.send_to(&packet(200), addrs[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        peer.send_to(&packet(0), addrs[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    let started = tokio::time::Instant::now();
+    let _ = node.stop.send(());
+    let result = node.task.await.unwrap();
+    assert!(result.is_ok(), "the stop failed after {:.1} s: {result:?}", started.elapsed().as_secs_f64());
 }

@@ -22,6 +22,7 @@ struct Inner {
     fail_detach: AtomicBool,
     panic_attach: AtomicBool,
     detach_delay_ms: AtomicU64,
+    attach_delay_ms: AtomicU64,
 }
 
 impl FakeBackend {
@@ -51,6 +52,11 @@ impl FakeBackend {
         self.inner.detach_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
+    /// Makes every attach take this long before it succeeds or fails, like a slow OS command.
+    pub fn set_attach_delay(&self, delay: Duration) {
+        self.inner.attach_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
     /// Makes attach panic, to test what happens when the task running the backend dies.
     pub fn set_panic_on_attach(&self, panic: bool) {
         self.inner.panic_attach.store(panic, Ordering::SeqCst);
@@ -73,6 +79,10 @@ impl VipBackend for FakeBackend {
     async fn attach(&self, vip: &Vip) -> anyhow::Result<()> {
         self.record(format!("attach {}", vip.ip));
         assert!(!self.inner.panic_attach.load(Ordering::SeqCst), "simulated panic in attach");
+        let delay = self.inner.attach_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.inner.fail_attach.load(Ordering::SeqCst) {
             anyhow::bail!("simulated attach failure");
         }

@@ -422,11 +422,12 @@ on_master = "/usr/local/bin/vip-alert.sh master"
 ### 11.1 Start-up sequence
 
 1. Load and validate the config. On error, exit with code **2**.
-2. Bind the UDP socket, and check that every VIP's interface exists (§10). If either fails, exit with code 1.
+2. Check that every VIP's interface exists (§10). If one does not, exit with code 1.
 3. Run `detach` for every configured VIP, cleaning up after a crash. If this fails, exit with code 1, because the node is not safe to run.
-4. Run the first round of checks and compute `Health`.
-5. Create the `Machine` and feed it `Started { health }`.
-6. Enter the event loop.
+4. Bind the UDP socket. If this fails, exit with code 1. Binding only after step 3 means that a socket that cannot be bound, because the port is taken or the `bind` IP is gone, does not skip the cleanup.
+5. Run the first round of checks and compute `Health`.
+6. Create the `Machine` and feed it `Started { health }`.
+7. Enter the event loop.
 
 A stop during start-up never cuts step 3 short, because the peer may already hold the VIP:
 - A stop during the interface check skips the rest of that check. Step 3 still runs to the end, and then vipd exits.
@@ -450,14 +451,16 @@ The loop carries out the resulting actions as follows.
 
 ### 11.3 VIP worker (`vip_worker.rs`)
 
-A single task that owns the backend and processes requests in order.
+A single task that owns the backend and processes requests in order, skipping those that a later request supersedes.
 
 - It holds a **desired state**: attached or detached.
 - **`AttachVips`** sets the desired state to *attached*, then runs `attach` and `announce` for each VIP. If any attach fails, it reports `AttachFailed`; the machine then emits `DetachVips`.
+  - Each attach request carries a number, one higher for every `AttachVips`, and `AttachFailed` carries the number of the attach that failed. The runtime passes the failure to the machine only if it belongs to the newest attach. An older one belongs to a master term the node has since left, and the attach queued after it may still succeed, so it must not fault the current term.
   - On Linux, `announce` sends the first burst of gratuitous ARPs.
 - **`DetachVips`** sets the desired state to *detached* and runs `detach` for each VIP.
   - If detach fails, it retries every 2 s, logging an error each time, until it succeeds or the desired state changes.
 - **`Announce`** runs `announce` for each VIP only if the desired state is *attached*.
+- **Coalescing.** Before it runs an attach, detach or announce request, the worker takes every request already waiting. If a later attach or detach is among them, it skips the current one: that later request supersedes an attach or detach, and makes an announce moot. So a backend slower than the election (Windows' 3 s duplicate-address check, or slow overrides) does not replay a backlog of past terms, which would leave the VIP trailing the election by seconds and make a stop wait for the whole backlog. The shutdown flush (§11.4) is never skipped.
 
 ### 11.4 Shutdown
 
