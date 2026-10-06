@@ -376,7 +376,7 @@ The default path is `/etc/vipd/vipd.toml` on Linux and `C:\ProgramData\vipd\vipd
 | `bind` | required | `ip:port`. The IPv4 address must not be `0.0.0.0`, because it is needed for tie-breaks, and the port must not be 0. |
 | `peers` | required | at least one `ip:port`; unique IPs; must not contain the `bind` IP; port not 0 |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn` or `error`; `RUST_LOG` overrides it |
-| `log_dir` | `C:\ProgramData\vipd\logs` | an absolute path; used by the Windows service only (§13) |
+| `log_dir` | `C:\ProgramData\vipd\logs` | used by the Windows service only (§13), where it must be an absolute path |
 | `[[vip]]` | at least one | `ip` (IPv4, required; a unique unicast address that is not the `bind` or a peer IP), `prefix` (1–32, default 32, the safe choice; see below), `interface` (required, must exist; on Linux also a valid interface name; on Windows the adapter's name, not its index, without surrounding whitespace) |
 | `[[check]]` | none | see §8 |
 | `[hooks]` | none | see §9 |
@@ -412,7 +412,7 @@ interface = "eth0"                  # on Windows the adapter name, e.g. "Etherne
 
 [[check]]
 name = "nginx"
-command = "curl -sf -o /dev/null http://127.0.0.1/"
+command = "curl -sf -o /dev/null http://127.0.0.1/"   # on Windows: -o NUL
 fall = 2
 rise = 2
 weight = -60                        # 150 -> 90 while failing, so a priority-100 node takes over

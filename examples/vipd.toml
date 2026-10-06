@@ -18,7 +18,7 @@ interface = "eth0"                  # on Windows the adapter name, e.g. "Etherne
 
 [[check]]
 name = "nginx"
-command = "curl -sf -o /dev/null http://127.0.0.1/"
+command = "curl -sf -o /dev/null http://127.0.0.1/"   # on Windows: -o NUL
 fall = 2
 rise = 2
 weight = -60                        # 150 -> 90 while failing, so a priority-100 node takes over
