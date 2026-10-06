@@ -39,7 +39,7 @@ It lists the problems it finds and exits with 0 if the config is valid, or 2 if 
 
 ### Checks and hooks
 
-- A check is any command, run without a shell, and exit code 0 passes. Only double quotes group words. For pipes, `&&` or variables, call a shell and write the command as a TOML literal string: `command = 'sh -c "pgrep -x nginx && curl -sf http://127.0.0.1/"'` (on Windows, `'cmd /C "…"'`). Hooks follow the same rules.
+- A check is any command, run without a shell, and exit code 0 passes. Only double quotes group words. For pipes, `&&` or variables, call a shell and write the command as a TOML literal string: `command = 'sh -c "pgrep -x nginx && curl -sf -o /dev/null http://127.0.0.1/"'` (on Windows, `'cmd /C "…"'`). Hooks follow the same rules.
 - On Windows the service runs checks and hooks as LocalSystem. Give programs outside `C:\Windows\System32\` by full path, because Windows looks them up in PATH.
 - A check's `weight` (default 0) adjusts the node's priority: a negative weight applies while the check fails, a positive one while it passes, and `weight = 0` takes the node out of the election while the check fails. If a weight-0 check fails on every node, no node holds the VIP.
 - To see why a check fails, set `log_level = "debug"` (or run with `RUST_LOG=vipd=debug`).

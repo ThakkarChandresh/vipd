@@ -16,9 +16,13 @@ fn log_panics() {
     }));
 }
 
-/// Logs to stdout. `RUST_LOG` overrides `level`.
+/// Logs to stdout, with colours only on a terminal, so none end up in the journal or in piped output.
+/// `RUST_LOG` overrides `level`.
 pub fn init_stdout(level: &str) {
-    let _ = tracing_subscriber::fmt().with_env_filter(filter(level)).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter(level))
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .try_init();
     log_panics();
 }
 

@@ -52,8 +52,9 @@ pub fn send(iface: &str, ip: Ipv4Addr, count: u32) -> anyhow::Result<()> {
     }
 
     let protocol = (libc::ETH_P_ARP as u16).to_be();
+    // Close-on-exec, so the commands vipd starts while it is open do not inherit a raw socket.
     // SAFETY: a plain socket(2) call; the result is checked below.
-    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, i32::from(protocol)) };
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, i32::from(protocol)) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error())
             .context("cannot open a raw packet socket (needs root or CAP_NET_RAW)");

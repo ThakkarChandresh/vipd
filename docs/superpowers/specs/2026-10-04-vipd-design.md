@@ -323,7 +323,7 @@ How the gratuitous ARP is sent:
   - On Windows only the direct process is killed; the rest would need a Job Object.
 - **Placeholders** are `{ip}`, `{prefix}`, `{mask}` and `{iface}`. They are substituted inside each token *after* splitting, so a value containing a space (such as `Ethernet 2`) stays a single argument.
 - **Overrides stay idempotent.** `find` still runs first, so an override runs only when a change is actually needed. For an override, exit code 0 means success.
-- **The Windows duplicate-address check (§7.3) runs only after the built-in attach.** An override may do something completely different, such as calling a cloud API.
+- **The Windows duplicate-address check (§7.3) runs only after the built-in attach.** An override may do more than the built-in command, such as also calling a cloud API, but it must still add or remove `{ip}` on `{iface}`: the built-in `find` decides whether an override runs at all, so a detach override never runs for an address `find` cannot see.
 
 ## 8. Health checks (`checks`)
 
@@ -412,7 +412,7 @@ interface = "eth0"                  # on Windows the adapter name, e.g. "Etherne
 
 [[check]]
 name = "nginx"
-command = "curl -sf http://127.0.0.1/"
+command = "curl -sf -o /dev/null http://127.0.0.1/"
 fall = 2
 rise = 2
 weight = -60                        # 150 -> 90 while failing, so a priority-100 node takes over
