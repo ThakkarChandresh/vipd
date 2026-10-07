@@ -25,6 +25,11 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2"
 windows-service = "0.7"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["test-util"] }

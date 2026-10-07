@@ -1,5 +1,6 @@
 //! Windows backend: `netsh` commands, plus a PowerShell duplicate-address check after attaching
-//! (spec §7.3). Everything except the trait implementation is a pure function tested on any OS.
+//! (spec §7.3). Everything except the trait implementation and the link check is a pure function
+//! tested on any OS.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -104,6 +105,40 @@ pub fn output_has_ip(output: &str, ip: Ipv4Addr) -> bool {
     output.split_whitespace().any(|token| token == wanted)
 }
 
+/// Whether the adapter's link is up: its operational status is up and its media is connected, as
+/// the IP Helper API reports them: two system calls, not a netsh or PowerShell process, every advert
+/// interval. Switching Wi-Fi off leaves the adapter's address in place, so only this notices.
+/// An alias that cannot be resolved, or an entry that cannot be read, counts as up ("cannot tell",
+/// see `VipBackend::link_up`): the bind-address check still applies, and a renamed adapter must
+/// never keep a node in Fault for good.
+#[cfg(windows)]
+fn adapter_connected(alias: &str) -> bool {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, GetIfEntry2, MIB_IF_ROW2};
+    use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, MediaConnectStateConnected};
+
+    let alias: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `alias` is NUL-terminated and outlives both calls. `row` is plain data, for which all
+    // zeroes is a valid value, and both calls only write into it through pointers to it that do not
+    // outlive this block.
+    unsafe {
+        let mut row: MIB_IF_ROW2 = std::mem::zeroed();
+        if ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut row.InterfaceLuid) != NO_ERROR
+            || GetIfEntry2(&mut row) != NO_ERROR
+        {
+            return true;
+        }
+        row.OperStatus == IfOperStatusUp && row.MediaConnectState == MediaConnectStateConnected
+    }
+}
+
+/// Off Windows this backend is only compiled and unit-tested, and cannot ask Windows about an
+/// adapter, so it says yes, as a backend that cannot tell does.
+#[cfg(not(windows))]
+fn adapter_connected(_alias: &str) -> bool {
+    true
+}
+
 impl VipBackend for WindowsBackend {
     async fn interface_exists(&self, iface: &str) -> anyhow::Result<bool> {
         Ok(exec::run(&interface_args(iface), COMMAND_TIMEOUT, &[]).await?.success)
@@ -166,11 +201,8 @@ impl VipBackend for WindowsBackend {
         Ok(())
     }
 
-    async fn link_up(&self, _iface: &str) -> bool {
-        // Windows removes a disconnected adapter's addresses, so the runtime's bind-address check
-        // catches a lost network. Asking for the link state would mean running netsh or PowerShell
-        // every advert interval.
-        true
+    async fn link_up(&self, iface: &str) -> bool {
+        adapter_connected(iface)
     }
 }
 
@@ -212,6 +244,14 @@ mod tests {
         assert_eq!(parse_address_state(""), AddressState::Missing);
         assert_eq!(parse_address_state("Tentative"), AddressState::Tentative);
         assert_eq!(parse_address_state("Deprecated"), AddressState::Other("Deprecated".into()));
+    }
+
+    /// Runs only on Windows, in the release CI.
+    #[cfg(windows)]
+    #[test]
+    fn an_adapter_windows_does_not_know_counts_as_connected() {
+        // The FFI path runs, and "cannot tell" is up, so a renamed adapter never keeps a node in Fault.
+        assert!(adapter_connected("vipd-no-such-adapter"));
     }
 
     #[test]

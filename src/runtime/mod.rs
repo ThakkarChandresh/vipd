@@ -148,8 +148,8 @@ pub async fn run<B: VipBackend>(
                 }
                 update_health(&mut health, current_health(&cfg, &check_states, network.status() == CheckStatus::Ok))
             },
-            // The check runs after the tick, so cancelling the branch loses nothing. It is fast: a
-            // file read and a bind per tick.
+            // The check runs after the tick, so cancelling the branch loses nothing. It is fast: a bind,
+            // and a link query per VIP (a file read on Linux, two IP Helper calls on Windows).
             _ = network_checks.tick() => {
                 let problem = network_problem(&cfg, &manager).await;
                 if network.record(problem.is_none()) {
@@ -343,8 +343,9 @@ fn log_network_down(reason: &str) {
 }
 
 /// Whether `ip` is still an address of this machine. NetworkManager clears a Wi-Fi interface's
-/// addresses when it loses its network, and Windows does the same for a disconnected adapter. A
-/// host with net.ipv4.ip_nonlocal_bind set always passes; the link check still applies there.
+/// addresses when it loses its network. Windows keeps an adapter's address when Wi-Fi is switched
+/// off, so there the link check notices instead. A host with net.ipv4.ip_nonlocal_bind set always
+/// passes; the link check still applies there.
 fn bind_ip_present(ip: Ipv4Addr) -> bool {
     // Port 0 cannot collide with vipd's own socket.
     std::net::UdpSocket::bind((ip, 0)).is_ok()

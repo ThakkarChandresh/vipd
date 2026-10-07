@@ -52,7 +52,7 @@ A small Rust daemon that keeps one virtual IP (VIP) alive across two or more mac
 | `proto` | Packet encode and decode, the HMAC, and replay tracking | `hmac`, `sha2` |
 | `exec` | The command tokenizer (§7.4), and running a command without a shell, with a timeout | tokio, `libc` (Linux only) |
 | `checks` | Pure rise/fall state and health aggregation, plus an async runner that executes the check commands | `election` (for `Health`), `exec`, tokio |
-| `vip` | The `VipBackend` trait, `VipManager` and `CommandOverrides` (the `[vip_commands]` overrides), a Linux backend (`ip` plus gratuitous ARP via `libc`), a Windows backend (`netsh`) and a fake backend for tests | `exec`, tokio, `libc` (Linux only) |
+| `vip` | The `VipBackend` trait, `VipManager` and `CommandOverrides` (the `[vip_commands]` overrides), a Linux backend (`ip` plus gratuitous ARP via `libc`), a Windows backend (`netsh`, and the IP Helper API for the link) and a fake backend for tests | `exec`, tokio, `libc` (Linux only), `windows-sys` (Windows only) |
 | `runtime` | The event loop, the VIP worker and hook execution | everything above |
 | `service` | The Windows service: install, uninstall and the SCM entry point | `windows-service` (Windows only) |
 | `config` | Loading and validating the TOML | `checks`, `exec`, `proto`, `vip`, `serde`, `toml` |
@@ -99,7 +99,7 @@ docs/superpowers/specs/2026-10-04-vipd-design.md
   - A check with a **negative** weight contributes that weight while it is failing.
   - A check with a **positive** weight contributes that weight while it is passing.
   - A check with weight **0** contributes nothing. Instead, while it is failing the node is in Fault.
-- **The network.** The node is also in Fault while its network is down: its `bind` address is gone, or on Linux a VIP interface's link is down (§8). The checks still set its effective priority meanwhile.
+- **The network.** The node is also in Fault while its network is down: its `bind` address is gone, or a VIP interface's link is down (§8). The checks still set its effective priority meanwhile.
 
 ### 5.2 Timers
 
@@ -296,7 +296,7 @@ How the gratuitous ARP is sent:
 | attach | `netsh interface ipv4 add address "{iface}" {ip} {mask} store=active skipassource=true`, then the duplicate-address check below |
 | detach | `netsh interface ipv4 delete address "{iface}" {ip} store=active` |
 | announce | No-op. Windows announces a new address itself; this is to be verified (§15). |
-| link | Always up. Windows clears a disconnected adapter's addresses, so the `bind` address check (§8) notices a lost network instead, without running netsh or PowerShell every advert interval. That works only when the `bind` address is on the VIP's adapter. |
+| link | Up while the adapter's operational status is up and its media is connected, read through the IP Helper API: `ConvertInterfaceAliasToLuid`, then `GetIfEntry2`. These are system calls, so no netsh or PowerShell process runs every advert interval. An alias that cannot be resolved, or an entry that cannot be read, counts as up, so a renamed adapter never keeps the node in Fault; the `bind` address check (§8) still applies. |
 
 - **`store=active`** means the VIP disappears when the machine reboots.
 - **`skipassource=true`** keeps outgoing traffic on the node's own IP.
@@ -349,9 +349,9 @@ How the gratuitous ARP is sent:
 - **Aggregation.** `aggregate(base, &checks) -> Health` computes §5.1.
   - The runtime sends `HealthChanged` only when `Health` actually changes.
 - **Start-up.** Every check runs once, concurrently, and each run is bounded by its own timeout. The machine starts only after all of them finish (§11.1).
-- **Network tracking.** Besides the checks, the runtime checks this node's network once at start-up, after the first round of checks, and then every advert interval (§11.2). Each check is one bind and, on Linux, one file read per VIP. The network is down when:
-  - **the `bind` address is gone:** binding a UDP socket to it, on port 0, fails. NetworkManager clears a Wi-Fi interface's addresses when it loses its network, and Windows does the same for a disconnected adapter. On a host with `net.ipv4.ip_nonlocal_bind=1` this check always passes, and only the link check applies;
-  - **or, on Linux, a VIP interface's link is down:** `/sys/class/net/{iface}/operstate` cannot be read, or reads anything but `up` or `unknown`, such as `down`, `dormant` (Wi-Fi not associated) or `lowerlayerdown`. `unknown` counts as up because loopback, dummy and some drivers never report more. Windows does not check the link (§7.3).
+- **Network tracking.** Besides the checks, the runtime checks this node's network once at start-up, after the first round of checks, and then every advert interval (§11.2). Each check is one bind, and one link query per VIP: a file read on Linux, two IP Helper calls on Windows. The network is down when:
+  - **the `bind` address is gone:** binding a UDP socket to it, on port 0, fails. NetworkManager clears a Wi-Fi interface's addresses when it loses its network. Windows keeps an adapter's address when Wi-Fi is switched off, so there the link check is what notices. On a host with `net.ipv4.ip_nonlocal_bind=1` this check always passes, and only the link check applies;
+  - **or a VIP interface's link is down.** On Linux, `/sys/class/net/{iface}/operstate` cannot be read, or reads anything but `up` or `unknown`, such as `down`, `dormant` (Wi-Fi not associated) or `lowerlayerdown`; `unknown` counts as up because loopback, dummy and some drivers never report more. On Windows, the adapter's operational status is not up, or its media is not connected, as the IP Helper API reports them (`GetIfEntry2`); an alias it cannot resolve counts as up (§7.3).
 
   How the runtime uses it:
   - **Hysteresis.** The network is tracked like a check with `fall = 3` and `rise = 1`: it counts as down only after three failed checks in a row, and as up again on the first good check. So a blip shorter than about two advert intervals (a Wi-Fi interface briefly `dormant` while it re-keys) moves nothing, and a real loss is noticed within about three. With `fall = 2`, a blip of one to two and a half intervals would fault the master, the peer would take over, and the master would preempt it back afterwards: two moves for nothing.
@@ -545,7 +545,7 @@ On Linux, the `service` subcommands print an error that points to `packaging/vip
 11. `check-config` rejects an adapter index given as `interface`, and accepts the adapter's name.
 12. Closing the console window of a foreground `vipd.exe run` leaves the VIP until vipd starts again, and start-up then removes it.
 13. The install steps from the README work: `icacls` leaves the config readable only by SYSTEM and Administrators, and the service starts from `C:\Program Files\vipd`.
-14. Turning Wi-Fi off removes the `bind` address, so the node goes to Fault; turning it back on lets it rejoin, and a node with the highest priority takes the VIP back.
+14. Turning Wi-Fi off makes the adapter's link go down while Windows keeps its address, so the node goes to Fault; turning it back on lets it rejoin, and a node with the highest priority takes the VIP back. The bind-address check alone did not notice this on real hardware: with Wi-Fi off four times, the longest for 3 minutes, Windows kept the adapter's DHCP address, and the node stayed master throughout.
 
 ## 16. Testing
 
