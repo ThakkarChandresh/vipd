@@ -91,7 +91,10 @@ pub async fn run<B: VipBackend>(
     let mut health = current_health(&cfg, &check_states, network.status() == CheckStatus::Ok);
 
     let (worker_events_tx, mut worker_events) = mpsc::unbounded_channel();
-    let (vip_tx, _worker) = vip_worker::spawn(Arc::clone(&manager), cfg.vips.clone(), worker_events_tx);
+    // While the VIPs are wanted, the worker checks every 5 advert intervals that they are still there.
+    let verify_interval = cfg.advert_interval() * 5;
+    let (vip_tx, _worker) =
+        vip_worker::spawn(Arc::clone(&manager), cfg.vips.clone(), verify_interval, worker_events_tx);
 
     let (check_tx, mut check_results) = mpsc::channel(64);
     let check_loops = CheckLoops(

@@ -96,8 +96,12 @@ impl Node {
     }
 }
 
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+async fn wait_until(what: &str, condition: impl FnMut() -> bool) {
+    wait_until_within(what, Duration::from_secs(5), condition).await;
+}
+
+async fn wait_until_within(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
     while !condition() {
         assert!(tokio::time::Instant::now() < deadline, "timed out waiting for: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -489,6 +493,28 @@ async fn a_master_that_loses_its_network_hands_over_and_takes_the_vip_back() {
     // Wi-Fi comes back, without the VIP. A rejoins and, with the higher priority, takes it back.
     node_a.fake.set_link_up(true);
     wait_until("A takes the VIP back", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    node_a.stop().await;
+    node_b.stop().await;
+}
+
+#[tokio::test]
+async fn a_vip_removed_from_the_master_is_added_back() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 161), Ipv4Addr::new(127, 0, 0, 162)]);
+    let node_a = Node::start(config(addrs[0], &[addrs[1]], 150));
+    let node_b = Node::start(config(addrs[1], &[addrs[0]], 130));
+    wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    // Something else removes the VIP from A, which stays master. Its VIP worker checks every 5
+    // advert intervals, 250 ms here, so the VIP is back well within a second.
+    node_a.fake.remove_externally(VIP);
+    let a_holds_it = || {
+        assert!(!node_b.holds_vip(), "B took the VIP");
+        node_a.holds_vip()
+    };
+    wait_until_within("A adds the VIP back", Duration::from_secs(1), a_holds_it).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(a_holds_it(), "A lost the VIP again");
 
     node_a.stop().await;
     node_b.stop().await;

@@ -1,6 +1,7 @@
 //! One task owns the VIP backend, so the event loop never waits for an OS command (spec §11.3). It
 //! applies attach / detach / announce requests in order, but skips any that a later attach or detach
-//! supersedes.
+//! supersedes. While the VIPs are wanted, it also checks now and then that they are still attached,
+//! and adds back and announces any that something else removed.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ pub enum VipRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerEvent {
-    /// The attach with this number failed.
+    /// The attach with this number failed, or a later check could not add back a VIP it attached.
     AttachFailed(u64),
 }
 
@@ -38,37 +39,56 @@ enum Desired {
     Detached,
 }
 
+/// What the worker does next.
+enum Work {
+    Request(VipRequest),
+    /// Try the failed detach again.
+    RetryDetach,
+    /// Check that the wanted VIPs are still attached.
+    Verify,
+}
+
 /// Starts the worker. Requests are applied in order, except that an attach, detach or announce is
 /// skipped when a later attach or detach is already queued; a failed detach is retried every 2 s
-/// until it succeeds or an attach replaces it. The worker stops when every request sender is
-/// dropped, and `events` closes when it stops, so a caller can treat that as the worker dying.
+/// until it succeeds or an attach replaces it. From a successful attach until a detach or a failed
+/// attach, the VIPs are checked every `verify_interval`: any that something else removed is added
+/// back and announced, and if that fails the worker reports `AttachFailed` with the number of the
+/// attach that made the VIPs wanted, as for a failed attach. The worker stops when every request
+/// sender is dropped, and `events` closes when it stops, so a caller can treat that as the worker
+/// dying.
 pub fn spawn<B: VipBackend>(
     manager: Arc<VipManager<B>>,
     vips: Vec<Vip>,
+    verify_interval: Duration,
     events: mpsc::UnboundedSender<WorkerEvent>,
 ) -> (mpsc::UnboundedSender<VipRequest>, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
         let mut desired = Desired::Detached;
+        // The number of the attach that set `desired` to attached. A failed verification reports it.
+        let mut current_attach = 0;
         // When the failed detach is tried again. New requests do not move it.
         let mut retry_at: Option<Instant> = None;
+        // When the wanted VIPs are next checked.
+        let mut verify_at: Option<Instant> = None;
         let mut flushes = Vec::new();
         // Requests already taken off the channel, oldest first.
         let mut queue = VecDeque::new();
         loop {
-            let request = match queue.pop_front() {
-                Some(request) => Some(request),
+            let work = match queue.pop_front() {
+                Some(request) => Work::Request(request),
                 None => tokio::select! {
                     request = rx.recv() => match request {
-                        Some(request) => Some(request),
+                        Some(request) => Work::Request(request),
                         None => break,
                     },
-                    () = sleep_until(retry_at) => None,
+                    () = sleep_until(retry_at) => Work::RetryDetach,
+                    () = sleep_until(verify_at) => Work::Verify,
                 },
             };
             // A later attach or detach supersedes this one, and makes an announce before it moot.
             // Skipping them keeps a slow backend from replaying old terms after the election moved on.
-            if matches!(request, Some(VipRequest::Attach(_) | VipRequest::Detach | VipRequest::Announce)) {
+            if matches!(work, Work::Request(VipRequest::Attach(_) | VipRequest::Detach | VipRequest::Announce)) {
                 while let Ok(more) = rx.try_recv() {
                     queue.push_back(more);
                 }
@@ -76,25 +96,38 @@ pub fn spawn<B: VipBackend>(
                     continue;
                 }
             }
-            match request {
-                None => retry_at = retry_after(detach_all(&manager, &vips).await),
-                Some(VipRequest::Attach(id)) => {
+            match work {
+                Work::RetryDetach => retry_at = retry_after(detach_all(&manager, &vips).await),
+                Work::Verify => {
+                    let verified = verify_all(&manager, &vips).await;
+                    verify_at = Some(Instant::now() + verify_interval);
+                    if !verified {
+                        // As for a failed attach: the node faults and the peer takes over.
+                        let _ = events.send(WorkerEvent::AttachFailed(current_attach));
+                    }
+                }
+                Work::Request(VipRequest::Attach(id)) => {
                     desired = Desired::Attached;
+                    current_attach = id;
                     retry_at = None;
-                    if !attach_all(&manager, &vips).await {
+                    if attach_all(&manager, &vips).await {
+                        verify_at = Some(Instant::now() + verify_interval);
+                    } else {
+                        verify_at = None;
                         let _ = events.send(WorkerEvent::AttachFailed(id));
                     }
                 }
-                Some(VipRequest::Detach) => {
+                Work::Request(VipRequest::Detach) => {
                     desired = Desired::Detached;
+                    verify_at = None;
                     retry_at = retry_after(detach_all(&manager, &vips).await);
                 }
-                Some(VipRequest::Announce) => {
+                Work::Request(VipRequest::Announce) => {
                     if desired == Desired::Attached {
                         announce_all(&manager, &vips).await;
                     }
                 }
-                Some(VipRequest::Flush(done)) => flushes.push(done),
+                Work::Request(VipRequest::Flush(done)) => flushes.push(done),
             }
             if retry_at.is_none() {
                 for done in flushes.drain(..) {
@@ -138,6 +171,38 @@ async fn attach_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> boo
     true
 }
 
+/// Adds back any VIP that something else removed, such as NetworkManager clearing an interface,
+/// and then announces them all. Returns false as soon as a VIP cannot be checked or added back.
+async fn verify_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> bool {
+    let mut added_back = false;
+    for vip in vips {
+        match manager.ensure_attached(vip).await {
+            Ok(true) => {
+                tracing::warn!(
+                    vip = %vip.ip,
+                    interface = %vip.interface,
+                    "the VIP was removed outside vipd; added it back"
+                );
+                added_back = true;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(
+                    vip = %vip.ip,
+                    interface = %vip.interface,
+                    error = %format!("{err:#}"),
+                    "verifying the VIP failed"
+                );
+                return false;
+            }
+        }
+    }
+    if added_back {
+        announce_all(manager, vips).await;
+    }
+    true
+}
+
 async fn detach_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> bool {
     let mut ok = true;
     for vip in vips {
@@ -175,13 +240,15 @@ mod tests {
     use crate::vip::CommandOverrides;
 
     const VIP_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 200);
+    /// The default: 5 advert intervals of 1 s.
+    const VERIFY: Duration = Duration::from_secs(5);
 
     fn setup() -> (FakeBackend, mpsc::UnboundedSender<VipRequest>, mpsc::UnboundedReceiver<WorkerEvent>) {
         let fake = FakeBackend::new();
         let manager = Arc::new(VipManager::new(fake.clone(), CommandOverrides::default()));
         let vips = vec![Vip { ip: VIP_IP, prefix: 24, interface: "eth0".into() }];
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let (tx, _handle) = spawn(manager, vips, events_tx);
+        let (tx, _handle) = spawn(manager, vips, VERIFY, events_tx);
         (fake, tx, events_rx)
     }
 
@@ -263,5 +330,54 @@ mod tests {
         fake.set_fail_attach(true);
         tx.send(VipRequest::Attach(1)).unwrap();
         assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vip_removed_outside_vipd_is_added_back_and_announced() {
+        let (fake, tx, _events) = setup();
+        tx.send(VipRequest::Attach(1)).unwrap();
+        flush(&tx).await;
+        fake.remove_externally(VIP_IP);
+        let before = fake.calls().len();
+        tokio::time::sleep(VERIFY + Duration::from_millis(1)).await;
+        assert!(fake.is_attached(VIP_IP), "the VIP was not added back within one verify interval");
+        assert_eq!(fake.calls()[before..], ["attach 10.0.0.200", "announce 10.0.0.200"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_re_add_reports_the_current_attach() {
+        let (fake, tx, mut events) = setup();
+        tx.send(VipRequest::Attach(7)).unwrap();
+        flush(&tx).await;
+        fake.remove_externally(VIP_IP);
+        fake.set_fail_attach(true);
+        let event = tokio::time::timeout(VERIFY + Duration::from_millis(1), events.recv()).await;
+        assert_eq!(event.expect("no event within one verify interval"), Some(WorkerEvent::AttachFailed(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_verified_while_the_vips_are_not_wanted() {
+        let (fake, tx, _events) = setup();
+        tx.send(VipRequest::Attach(1)).unwrap();
+        flush(&tx).await;
+        tx.send(VipRequest::Detach).unwrap();
+        flush(&tx).await;
+        let calls = fake.calls();
+        tokio::time::sleep(VERIFY * 3).await;
+        assert_eq!(fake.calls(), calls, "the detached VIP was verified");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_verified_after_a_failed_attach() {
+        let (fake, tx, mut events) = setup();
+        tx.send(VipRequest::Attach(1)).unwrap();
+        flush(&tx).await;
+        // The next attach has to add the VIP again, and fails.
+        fake.remove_externally(VIP_IP);
+        fake.set_fail_attach(true);
+        tx.send(VipRequest::Attach(2)).unwrap();
+        assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(2)));
+        tokio::time::sleep(VERIFY * 3).await;
+        assert!(events.try_recv().is_err(), "a verification retried the failed attach");
     }
 }
