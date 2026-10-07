@@ -475,7 +475,7 @@ A single task that owns the backend and processes requests in order, skipping th
 - **`DetachVips`** sets the desired state to *detached* and runs `detach` for each VIP.
   - If detach fails, it retries every 2 s, logging an error each time, until it succeeds or the desired state changes.
 - **`Announce`** runs `announce` for each VIP only if the desired state is *attached*.
-- **Verification.** While the VIPs are wanted, from a successful attach until a detach or a failed attach, the worker checks every 5 advert intervals (5 s by default) that they are still there, by running `ensure_attached` for each VIP.
+- **Verification.** While the VIPs are wanted, from an attach until a detach, the worker checks every 5 advert intervals (5 s by default) that they are there, by running `ensure_attached` for each VIP; after a failed attach that the runtime ignored because the network was down (§11.2), this tries the attach again, in case the network returns before the network check notices.
   - A VIP that something else removed, such as NetworkManager clearing an interface, or an operator, is added back with the warning "the VIP was removed outside vipd; added it back". Then every VIP is announced again.
   - If a VIP cannot be checked or added back, the worker reports `AttachFailed` with the number of the attach that made the VIPs wanted. The runtime handles it as a failed attach (§5.5): the node goes to Fault with the hold-down, and the peer takes over.
   - A verification that falls due while an attach or detach request is waiting is skipped, because that request decides whether the VIPs are wanted; otherwise it could put back and announce a VIP that a waiting detach is about to remove.

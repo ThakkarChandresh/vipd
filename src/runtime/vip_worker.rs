@@ -1,7 +1,7 @@
 //! One task owns the VIP backend, so the event loop never waits for an OS command (spec §11.3). It
 //! applies attach / detach / announce requests in order, but skips any that a later attach or detach
-//! supersedes. While the VIPs are wanted, it also checks now and then that they are still attached,
-//! and adds back and announces any that something else removed.
+//! supersedes. While the VIPs are wanted, it also checks now and then that they are attached, and adds
+//! and announces any that are missing: one that something else removed, or one whose attach failed.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -50,12 +50,11 @@ enum Work {
 
 /// Starts the worker. Requests are applied in order, except that an attach, detach or announce is
 /// skipped when a later attach or detach is already queued; a failed detach is retried every 2 s
-/// until it succeeds or an attach replaces it. From a successful attach until a detach or a failed
-/// attach, the VIPs are checked every `verify_interval`: any that something else removed is added
-/// back and announced, and if that fails the worker reports `AttachFailed` with the number of the
-/// attach that made the VIPs wanted, as for a failed attach. The worker stops when every request
-/// sender is dropped, and `events` closes when it stops, so a caller can treat that as the worker
-/// dying.
+/// until it succeeds or an attach replaces it. From an attach until a detach, even after a failed
+/// attach, the VIPs are checked every `verify_interval`, unless an attach or detach is waiting: any
+/// that is missing is added and announced, and if that fails the worker reports `AttachFailed` with
+/// the number of the attach that made the VIPs wanted. The worker stops when every request sender
+/// is dropped, and `events` closes when it stops, so a caller can treat that as the worker dying.
 pub fn spawn<B: VipBackend>(
     manager: Arc<VipManager<B>>,
     vips: Vec<Vip>,
@@ -113,10 +112,12 @@ pub fn spawn<B: VipBackend>(
                     desired = Desired::Attached;
                     current_attach = id;
                     retry_at = None;
-                    if attach_all(&manager, &vips).await {
-                        verify_at = Some(Instant::now() + verify_interval);
-                    } else {
-                        verify_at = None;
+                    // Checked again later even if the attach fails. A failure the runtime forwards
+                    // leads to a detach, which stops the checks; one it ignores because the network
+                    // is down is tried again, in case the network returns before its check notices.
+                    let attached = attach_all(&manager, &vips).await;
+                    verify_at = Some(Instant::now() + verify_interval);
+                    if !attached {
                         let _ = events.send(WorkerEvent::AttachFailed(id));
                     }
                 }
@@ -397,16 +398,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn nothing_is_verified_after_a_failed_attach() {
-        let (fake, tx, mut events) = setup();
-        tx.send(VipRequest::Attach(1)).unwrap();
-        flush(&tx).await;
-        // The next attach has to add the VIP again, and fails.
-        fake.remove_externally(VIP_IP);
-        fake.set_fail_attach(true);
-        tx.send(VipRequest::Attach(2)).unwrap();
-        assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(2)));
-        tokio::time::sleep(VERIFY * 3).await;
-        assert!(events.try_recv().is_err(), "a verification retried the failed attach");
+    async fn a_failed_attach_is_retried_until_a_detach() {
+        {
+            // The runtime ignores a failure while the network is down, so no detach follows it. If
+            // the network returns before the network check notices, the next verification adds the
+            // VIP, with no new request.
+            let (fake, tx, mut events) = setup();
+            fake.set_fail_attach(true);
+            tx.send(VipRequest::Attach(3)).unwrap();
+            assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(3)));
+            fake.set_fail_attach(false);
+            tokio::time::sleep(VERIFY + Duration::from_millis(1)).await;
+            assert!(fake.is_attached(VIP_IP), "the failed attach was not tried again");
+        }
+        {
+            // A forwarded failure leads to a detach, which still stops the verifications.
+            let (fake, tx, mut events) = setup();
+            fake.set_fail_attach(true);
+            tx.send(VipRequest::Attach(4)).unwrap();
+            assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(4)));
+            tx.send(VipRequest::Detach).unwrap();
+            flush(&tx).await;
+            fake.set_fail_attach(false);
+            let calls = fake.calls();
+            tokio::time::sleep(VERIFY * 3).await;
+            assert_eq!(fake.calls(), calls, "the VIPs were verified after the detach");
+        }
     }
 }
