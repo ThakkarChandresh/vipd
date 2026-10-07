@@ -105,17 +105,57 @@ pub fn output_has_ip(output: &str, ip: Ipv4Addr) -> bool {
     output.split_whitespace().any(|token| token == wanted)
 }
 
-/// Whether the adapter's link is up: its operational status is up and its media is connected, as
-/// the IP Helper API reports them: two system calls, not a netsh or PowerShell process, every advert
-/// interval. Switching Wi-Fi off leaves the adapter's address in place, so only this notices.
-/// An alias that cannot be resolved, or an entry that cannot be read, counts as up ("cannot tell",
-/// see `VipBackend::link_up`): the bind-address check still applies, and a renamed adapter must
-/// never keep a node in Fault for good.
+/// windows-sys's `IfOperStatus*` and `MediaConnectState*` values, from
+/// `windows_sys::Win32::NetworkManagement::Ndis`. They are here so that `link_state_is_up` compiles
+/// and is tested on any OS; on Windows, the asserts below compare them with windows-sys's own.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ndis {
+    pub const UP: i32 = 1;
+    pub const DOWN: i32 = 2;
+    pub const TESTING: i32 = 3;
+    pub const UNKNOWN: i32 = 4;
+    pub const DORMANT: i32 = 5;
+    pub const NOT_PRESENT: i32 = 6;
+    pub const LOWER_LAYER_DOWN: i32 = 7;
+    pub const MEDIA_UNKNOWN: i32 = 0;
+    pub const MEDIA_CONNECTED: i32 = 1;
+    pub const MEDIA_DISCONNECTED: i32 = 2;
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows_sys::Win32::NetworkManagement::Ndis as sys;
+    assert!(ndis::UP == sys::IfOperStatusUp);
+    assert!(ndis::DOWN == sys::IfOperStatusDown);
+    assert!(ndis::TESTING == sys::IfOperStatusTesting);
+    assert!(ndis::UNKNOWN == sys::IfOperStatusUnknown);
+    assert!(ndis::DORMANT == sys::IfOperStatusDormant);
+    assert!(ndis::NOT_PRESENT == sys::IfOperStatusNotPresent);
+    assert!(ndis::LOWER_LAYER_DOWN == sys::IfOperStatusLowerLayerDown);
+    assert!(ndis::MEDIA_UNKNOWN == sys::MediaConnectStateUnknown);
+    assert!(ndis::MEDIA_CONNECTED == sys::MediaConnectStateConnected);
+    assert!(ndis::MEDIA_DISCONNECTED == sys::MediaConnectStateDisconnected);
+};
+
+/// Whether an adapter's link counts as up, from the operational status and media-connect state that
+/// `GetIfEntry2` reports. Only positive evidence counts as down, as on Linux, where `unknown` is up:
+/// a disconnected medium, or a status other than up or unknown (down, testing, dormant, not present
+/// or lower layer down).
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows calls it, but its test runs on any OS
+fn link_state_is_up(oper_status: i32, media_state: i32) -> bool {
+    media_state != ndis::MEDIA_DISCONNECTED && matches!(oper_status, ndis::UP | ndis::UNKNOWN)
+}
+
+/// Whether the adapter's link is up, as `link_state_is_up` decides from what the IP Helper API
+/// reports: two system calls, not a netsh or PowerShell process, every advert interval. Switching
+/// Wi-Fi off leaves the adapter's address in place, so only this notices. An alias that cannot be
+/// resolved, or an entry that cannot be read, counts as up ("cannot tell", see
+/// `VipBackend::link_up`): the bind-address check still applies, and a renamed adapter must never
+/// keep a node in Fault for good.
 #[cfg(windows)]
 fn adapter_connected(alias: &str) -> bool {
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, GetIfEntry2, MIB_IF_ROW2};
-    use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, MediaConnectStateConnected};
 
     let alias: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `alias` is NUL-terminated and outlives both calls. `row` is plain data, for which all
@@ -128,7 +168,7 @@ fn adapter_connected(alias: &str) -> bool {
         {
             return true;
         }
-        row.OperStatus == IfOperStatusUp && row.MediaConnectState == MediaConnectStateConnected
+        link_state_is_up(row.OperStatus, row.MediaConnectState)
     }
 }
 
@@ -244,6 +284,18 @@ mod tests {
         assert_eq!(parse_address_state(""), AddressState::Missing);
         assert_eq!(parse_address_state("Tentative"), AddressState::Tentative);
         assert_eq!(parse_address_state("Deprecated"), AddressState::Other("Deprecated".into()));
+    }
+
+    #[test]
+    fn only_positive_evidence_makes_a_windows_link_down() {
+        use ndis::*;
+        assert!(link_state_is_up(UP, MEDIA_CONNECTED));
+        assert!(link_state_is_up(UP, MEDIA_UNKNOWN));
+        assert!(link_state_is_up(UNKNOWN, MEDIA_UNKNOWN));
+        assert!(!link_state_is_up(UP, MEDIA_DISCONNECTED));
+        for down in [DOWN, TESTING, DORMANT, NOT_PRESENT, LOWER_LAYER_DOWN] {
+            assert!(!link_state_is_up(down, MEDIA_CONNECTED), "status {down}");
+        }
     }
 
     /// Runs only on Windows, in the release CI.
