@@ -24,6 +24,8 @@ struct Inner {
     detach_delay_ms: AtomicU64,
     attach_delay_ms: AtomicU64,
     missing_interface: Mutex<Option<String>>,
+    /// Down rather than up, so the derived default leaves every link up.
+    link_down: AtomicBool,
 }
 
 impl FakeBackend {
@@ -73,6 +75,16 @@ impl FakeBackend {
         self.inner.missing_interface.lock().unwrap().as_deref() == Some(iface)
     }
 
+    /// Takes the link of every interface down, or brings it back up. Links start up.
+    pub fn set_link_up(&self, up: bool) {
+        self.inner.link_down.store(!up, Ordering::SeqCst);
+    }
+
+    /// Drops the VIP without recording a call, as when NetworkManager clears an interface's addresses.
+    pub fn remove_externally(&self, ip: Ipv4Addr) {
+        self.inner.attached.lock().unwrap().remove(&ip);
+    }
+
     fn record(&self, call: String) {
         self.inner.calls.lock().unwrap().push(call);
     }
@@ -120,5 +132,9 @@ impl VipBackend for FakeBackend {
     async fn announce(&self, vip: &Vip) -> anyhow::Result<()> {
         self.record(format!("announce {}", vip.ip));
         Ok(())
+    }
+
+    async fn link_up(&self, _iface: &str) -> bool {
+        !self.inner.link_down.load(Ordering::SeqCst)
     }
 }

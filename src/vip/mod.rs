@@ -68,6 +68,9 @@ pub trait VipBackend: Send + Sync + 'static {
     fn detach(&self, vip: &Vip, found: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Tells the LAN where the VIP lives now. A no-op where the OS does this itself.
     fn announce(&self, vip: &Vip) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Is this interface's link up? Backends that cannot tell say yes; the bind-address check in the
+    /// runtime still catches a lost network there (spec §8).
+    fn link_up(&self, iface: &str) -> impl Future<Output = bool> + Send;
 }
 
 /// Wraps a backend: runs `find` first so attach and detach are idempotent, and applies the
@@ -112,6 +115,11 @@ impl<B: VipBackend> VipManager<B> {
 
     pub async fn announce(&self, vip: &Vip) -> anyhow::Result<()> {
         self.backend.announce(vip).await
+    }
+
+    /// Is this interface's link up? See `VipBackend::link_up`.
+    pub async fn link_up(&self, iface: &str) -> bool {
+        self.backend.link_up(iface).await
     }
 }
 

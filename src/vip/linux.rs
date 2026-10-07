@@ -47,6 +47,13 @@ pub fn parse_find(output: &str, ip: Ipv4Addr) -> Option<String> {
     })
 }
 
+/// Whether a `/sys/class/net/{iface}/operstate` value means the link is up. `unknown` counts as up,
+/// because loopback, dummy and some drivers never report more. Everything else is down, such as
+/// `dormant` for Wi-Fi that is not associated, or `lowerlayerdown`.
+pub fn operstate_is_up(state: &str) -> bool {
+    matches!(state.trim(), "up" | "unknown")
+}
+
 impl VipBackend for LinuxBackend {
     async fn interface_exists(&self, iface: &str) -> anyhow::Result<bool> {
         Ok(Path::new("/sys/class/net").join(iface).exists())
@@ -68,6 +75,13 @@ impl VipBackend for LinuxBackend {
     async fn announce(&self, vip: &Vip) -> anyhow::Result<()> {
         let (iface, ip) = (vip.interface.clone(), vip.ip);
         tokio::task::spawn_blocking(move || garp::send(&iface, ip, GARP_COUNT)).await?
+    }
+
+    async fn link_up(&self, iface: &str) -> bool {
+        // config.rs's Linux name rules keep `iface` inside /sys/class/net. An unreadable file means
+        // the interface is gone, so its link is down.
+        let operstate = Path::new("/sys/class/net").join(iface).join("operstate");
+        std::fs::read_to_string(operstate).is_ok_and(|state| operstate_is_up(&state))
     }
 }
 
@@ -99,6 +113,23 @@ mod tests {
         let backend = LinuxBackend::new();
         assert!(backend.interface_exists("lo").await.unwrap());
         assert!(!backend.interface_exists("vipd-no-such0").await.unwrap());
+    }
+
+    #[test]
+    fn only_up_and_unknown_operstates_are_up() {
+        for state in ["up", "unknown", "up\n", "unknown\n"] {
+            assert!(operstate_is_up(state), "{state:?}");
+        }
+        for state in ["down", "dormant", "lowerlayerdown", "notpresent", "testing", "down\n", ""] {
+            assert!(!operstate_is_up(state), "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_the_link_state_from_sysfs() {
+        let backend = LinuxBackend::new();
+        assert!(backend.link_up("lo").await, "lo reports `unknown`");
+        assert!(!backend.link_up("vipd-no-such0").await, "an unreadable operstate means down");
     }
 
     #[test]

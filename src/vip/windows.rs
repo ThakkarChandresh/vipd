@@ -165,6 +165,13 @@ impl VipBackend for WindowsBackend {
         // Windows announces a newly added address itself (to be confirmed on hardware, spec §15).
         Ok(())
     }
+
+    async fn link_up(&self, _iface: &str) -> bool {
+        // Windows removes a disconnected adapter's addresses, so the runtime's bind-address check
+        // catches a lost network. Asking for the link state would mean running netsh or PowerShell
+        // every advert interval.
+        true
+    }
 }
 
 #[cfg(test)]

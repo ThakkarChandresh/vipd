@@ -471,3 +471,25 @@ async fn a_clean_stop_is_not_stuck_behind_a_backlog() {
     let result = node.task.await.unwrap();
     assert!(result.is_ok(), "the stop failed after {:.1} s: {result:?}", started.elapsed().as_secs_f64());
 }
+
+#[tokio::test]
+async fn a_master_that_loses_its_network_hands_over_and_takes_the_vip_back() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 151), Ipv4Addr::new(127, 0, 0, 152)]);
+    // Preemption is on by default.
+    let node_a = Node::start(config(addrs[0], &[addrs[1]], 150));
+    let node_b = Node::start(config(addrs[1], &[addrs[0]], 130));
+    wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    // Wi-Fi goes off on A: its link goes down, and NetworkManager clears the VIP. Heartbeats still
+    // flow over loopback here, but A, in Fault, sends none and ignores B's.
+    node_a.fake.set_link_up(false);
+    node_a.fake.remove_externally(VIP);
+    wait_until("B takes over", || node_b.holds_vip() && !node_a.holds_vip()).await;
+
+    // Wi-Fi comes back, without the VIP. A rejoins and, with the higher priority, takes it back.
+    node_a.fake.set_link_up(true);
+    wait_until("A takes the VIP back", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    node_a.stop().await;
+    node_b.stop().await;
+}

@@ -14,8 +14,9 @@ use anyhow::Context;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
 
-use crate::checks::{self, CheckState};
+use crate::checks::{self, CheckState, CheckStatus};
 use crate::config::{Config, HookCommands};
 use crate::election::{Action, Event, Health, HookKind, Machine, MachineConfig};
 use crate::proto::{self, Codec, Heartbeat, ReplayGuard, PACKET_LEN};
@@ -78,10 +79,19 @@ pub async fn run<B: VipBackend>(
         () = &mut shutdown => return Ok(()),
         states = first_check_round(&cfg) => states?,
     };
-    let mut health = current_health(&cfg, &check_states);
+    // The network is tracked like a check with fall = 2 and rise = 1, so one bad sample (a Wi-Fi
+    // interface briefly `dormant` while it re-keys) does not cause a failover (spec §8). As with a
+    // check, the first result decides on its own: a node whose network is down starts in Fault.
+    let mut network = CheckState::new(2, 1);
+    let problem = network_problem(&cfg, &manager).await;
+    if let Some(reason) = &problem {
+        log_network_down(reason);
+    }
+    network.record(problem.is_none());
+    let mut health = current_health(&cfg, &check_states, network.status() == CheckStatus::Ok);
 
     let (worker_events_tx, mut worker_events) = mpsc::unbounded_channel();
-    let (vip_tx, _worker) = vip_worker::spawn(manager, cfg.vips.clone(), worker_events_tx);
+    let (vip_tx, _worker) = vip_worker::spawn(Arc::clone(&manager), cfg.vips.clone(), worker_events_tx);
 
     let (check_tx, mut check_results) = mpsc::channel(64);
     let check_loops = CheckLoops(
@@ -107,6 +117,11 @@ pub async fn run<B: VipBackend>(
     let actions = machine.handle(Event::Started { health }, Instant::now());
     node.execute(&machine, actions).await;
 
+    // Start-up has just checked the network, so the next check is one advert interval away.
+    let mut network_checks =
+        tokio::time::interval_at(tokio::time::Instant::now() + cfg.advert_interval(), cfg.advert_interval());
+    network_checks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let mut buf = [0u8; 2 * PACKET_LEN];
     loop {
         let deadline = machine.next_deadline();
@@ -129,17 +144,21 @@ pub async fn run<B: VipBackend>(
                         "check changed"
                     );
                 }
-                let new_health = current_health(&cfg, &check_states);
-                if new_health == health {
-                    None
+                update_health(&mut health, current_health(&cfg, &check_states, network.status() == CheckStatus::Ok))
+            },
+            // The check runs after the tick, so cancelling the branch loses nothing. It is fast: a
+            // file read and a bind per tick.
+            _ = network_checks.tick() => {
+                let problem = network_problem(&cfg, &manager).await;
+                if network.record(problem.is_none()) {
+                    match &problem {
+                        Some(reason) => log_network_down(reason),
+                        None => tracing::info!("the network is back"),
+                    }
+                    let network_ok = network.status() == CheckStatus::Ok;
+                    update_health(&mut health, current_health(&cfg, &check_states, network_ok))
                 } else {
-                    tracing::info!(
-                        priority = new_health.effective_priority,
-                        fault = new_health.fault,
-                        "health changed"
-                    );
-                    health = new_health;
-                    Some(Event::HealthChanged(health))
+                    None
                 }
             },
             worker_event = worker_events.recv() => match worker_event {
@@ -263,9 +282,48 @@ fn random_u16() -> u16 {
     std::collections::hash_map::RandomState::new().build_hasher().finish() as u16
 }
 
-fn current_health(cfg: &Config, states: &[CheckState]) -> Health {
+/// The checks' health, in fault while the network is down. The checks still set the priority.
+fn current_health(cfg: &Config, states: &[CheckState], network_ok: bool) -> Health {
     let weighted: Vec<_> = cfg.checks.iter().zip(states).map(|(spec, state)| (spec.weight, state.status())).collect();
-    checks::aggregate(cfg.priority, &weighted)
+    let health = checks::aggregate(cfg.priority, &weighted);
+    Health { fault: health.fault || !network_ok, ..health }
+}
+
+/// Stores `new` as the node's health. Returns the event that tells the machine, or `None` if the
+/// health did not change.
+fn update_health(health: &mut Health, new: Health) -> Option<Event> {
+    if new == *health {
+        return None;
+    }
+    tracing::info!(priority = new.effective_priority, fault = new.fault, "health changed");
+    *health = new;
+    Some(Event::HealthChanged(new))
+}
+
+/// Why this node's network is unusable, or `None` if it is fine (spec §8).
+async fn network_problem<B: VipBackend>(cfg: &Config, manager: &VipManager<B>) -> Option<String> {
+    let ip = *cfg.bind.ip();
+    if !bind_ip_present(ip) {
+        return Some(format!("bind address {ip} is not on this machine"));
+    }
+    for vip in &cfg.vips {
+        if !manager.link_up(&vip.interface).await {
+            return Some(format!("interface {} is down", vip.interface));
+        }
+    }
+    None
+}
+
+fn log_network_down(reason: &str) {
+    tracing::warn!(reason = %reason, "the network is down: this node leaves the election until it is back");
+}
+
+/// Whether `ip` is still an address of this machine. NetworkManager clears a Wi-Fi interface's
+/// addresses when it loses its network, and Windows does the same for a disconnected adapter. A
+/// host with net.ipv4.ip_nonlocal_bind set always passes; the link check still applies there.
+fn bind_ip_present(ip: Ipv4Addr) -> bool {
+    // Port 0 cannot collide with vipd's own socket.
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
 async fn sleep_until(deadline: Option<Instant>) {
@@ -427,9 +485,7 @@ impl Node {
 mod tests {
     use super::*;
 
-    async fn test_node() -> Node {
-        let cfg = Config::from_toml(
-            r#"
+    const TEST_CONFIG: &str = r#"
 node_name = "a"
 group_id = 1
 priority = 100
@@ -440,12 +496,29 @@ peers = ["127.0.0.2:8458"]
 [[vip]]
 ip = "10.99.0.1"
 interface = "fake0"
-"#,
-        )
-        .unwrap();
+"#;
+
+    async fn test_node() -> Node {
+        let cfg = Config::from_toml(TEST_CONFIG).unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (vip_tx, _vip_rx) = mpsc::unbounded_channel();
         Node::new(&cfg, socket, vip_tx)
+    }
+
+    #[test]
+    fn an_address_of_this_machine_is_present() {
+        assert!(bind_ip_present(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn a_lost_network_is_a_fault_and_the_checks_still_set_the_priority() {
+        let check = "[[check]]\nname = \"web\"\ncommand = \"true\"\nweight = -60\n";
+        let cfg = Config::from_toml(&format!("{TEST_CONFIG}\n{check}")).unwrap();
+        let mut failing = CheckState::new(1, 1);
+        failing.record(false);
+        let states = [failing];
+        assert_eq!(current_health(&cfg, &states, true), Health { effective_priority: 40, fault: false });
+        assert_eq!(current_health(&cfg, &states, false), Health { effective_priority: 40, fault: true });
     }
 
     #[tokio::test]
