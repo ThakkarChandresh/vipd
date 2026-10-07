@@ -1,0 +1,130 @@
+# Builds vipd for Linux and Windows and publishes the binaries as a GitHub Release.
+#
+# To release, set `version` in Cargo.toml, commit, then push a matching tag:
+#     git tag v0.1.0 && git push origin v0.1.0
+# "Run workflow" on the Actions tab builds and tests without releasing, and attaches the archives to the run.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned, so that a new Rust release cannot fail a vipd release with a new clippy lint. Bump it on purpose.
+  RUST_TOOLCHAIN: "1.97.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            # musl gives a static binary, which runs on any distro whatever its glibc version.
+            target: x86_64-unknown-linux-musl
+            exe: vipd
+            ext: tar.gz
+          - os: windows
+            runner: windows-latest
+            # .cargo/config.toml links the C runtime in statically.
+            target: x86_64-pc-windows-msvc
+            exe: vipd.exe
+            ext: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Check the tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(cargo pkgid)
+          version=${version##*[#@]}
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Cargo.toml has version $version, but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --target "$TARGET" -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Stage the archive contents
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version=$GITHUB_REF_NAME; else version=${GITHUB_SHA::7}; fi
+          name="vipd-$version-x86_64-${{ matrix.os }}"
+          mkdir -p "dist/$name/examples"
+          cp "target/$TARGET/release/${{ matrix.exe }}" README.md "dist/$name/"
+          cp examples/vipd.toml "dist/$name/examples/"
+          if [ "${{ matrix.os }}" = linux ]; then
+            mkdir "dist/$name/packaging"
+            cp packaging/vipd.service "dist/$name/packaging/"
+          fi
+          echo "NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Archive (Linux)
+        if: runner.os == 'Linux'
+        working-directory: dist
+        run: tar -czf "$NAME.tar.gz" "$NAME"
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        working-directory: dist
+        shell: pwsh
+        run: Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.os }}
+          path: dist/${{ env.NAME }}.${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY" --title "vipd $GITHUB_REF_NAME" --generate-notes --verify-tag

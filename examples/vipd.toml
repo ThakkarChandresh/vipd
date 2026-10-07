@@ -1,0 +1,27 @@
+# vipd example configuration (see docs/superpowers/specs/2026-10-04-vipd-design.md §10).
+# Linux: /etc/vipd/vipd.toml    Windows: C:\ProgramData\vipd\vipd.toml
+
+node_name = "web-a"                 # appears in the start-up log line
+group_id = 51                       # same on every node
+priority = 150                      # 1-254, higher wins
+preempt = true                      # a returning higher node takes the VIP back
+advert_interval_ms = 1000
+auth_key = "a-long-random-shared-secret"   # replace with your own random secret; same on every node, 16+ characters
+
+bind = "192.168.1.13:8458"          # this node's IP (not 0.0.0.0) and UDP port
+peers = ["192.168.1.14:8458"]       # every other node
+
+[[vip]]
+ip = "192.168.1.200"
+prefix = 32                         # the default; see "VIP prefix" in the README before using /24
+interface = "eth0"                  # on Windows the adapter name, e.g. "Ethernet"
+
+[[check]]
+name = "nginx"
+command = "curl -sf -o /dev/null http://127.0.0.1/"   # on Windows: -o NUL
+fall = 2
+rise = 2
+weight = -60                        # 150 -> 90 while failing, so a priority-100 node takes over
+
+[hooks]
+on_master = "/usr/local/bin/vip-alert.sh master"
