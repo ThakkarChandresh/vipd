@@ -151,25 +151,35 @@ fn link_state_is_up(oper_status: i32, media_state: i32) -> bool {
 /// Wi-Fi off leaves the adapter's address in place, so only this notices. An alias that cannot be
 /// resolved, or an entry that cannot be read, counts as up ("cannot tell", see
 /// `VipBackend::link_up`): the bind-address check still applies, and a renamed adapter must never
-/// keep a node in Fault for good.
+/// keep a node in Fault for good. That case is logged once per adapter, so it is not silent.
 #[cfg(windows)]
 fn adapter_connected(alias: &str) -> bool {
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, GetIfEntry2, MIB_IF_ROW2};
 
-    let alias: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `alias` is NUL-terminated and outlives both calls. `row` is plain data, for which all
+    let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives both calls. `row` is plain data, for which all
     // zeroes is a valid value, and both calls only write into it through pointers to it that do not
     // outlive this block.
     unsafe {
         let mut row: MIB_IF_ROW2 = std::mem::zeroed();
-        if ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut row.InterfaceLuid) != NO_ERROR
-            || GetIfEntry2(&mut row) != NO_ERROR
+        if ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut row.InterfaceLuid) == NO_ERROR
+            && GetIfEntry2(&mut row) == NO_ERROR
         {
-            return true;
+            return link_state_is_up(row.OperStatus, row.MediaConnectState);
         }
-        link_state_is_up(row.OperStatus, row.MediaConnectState)
     }
+    // Said once per adapter: a name Windows does not know would otherwise switch the check off silently.
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|known| known == alias) {
+        warned.push(alias.to_owned());
+        tracing::warn!(
+            interface = %alias,
+            "cannot read this adapter's link state, so a lost link is not noticed; check the name, including its case"
+        );
+    }
+    true
 }
 
 /// Off Windows this backend is only compiled and unit-tested, and cannot ask Windows about an

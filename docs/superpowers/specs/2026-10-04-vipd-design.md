@@ -296,7 +296,7 @@ How the gratuitous ARP is sent:
 | attach | `netsh interface ipv4 add address "{iface}" {ip} {mask} store=active skipassource=true`, then the duplicate-address check below |
 | detach | `netsh interface ipv4 delete address "{iface}" {ip} store=active` |
 | announce | No-op. Windows announces a new address itself; this is to be verified (§15). |
-| link | Read through the IP Helper API: `ConvertInterfaceAliasToLuid`, then `GetIfEntry2`. These are system calls, so no netsh or PowerShell process runs every advert interval. Only positive evidence counts as down, as on Linux: a disconnected medium, or an operational status other than up or unknown (down, testing, dormant, not present or lower layer down). An unknown status or medium counts as up, and so does an alias that cannot be resolved or an entry that cannot be read, so a renamed adapter never keeps the node in Fault; the `bind` address check (§8) still applies. |
+| link | Read through the IP Helper API: `ConvertInterfaceAliasToLuid`, then `GetIfEntry2`. These are system calls, so no netsh or PowerShell process runs every advert interval. Only positive evidence counts as down, as on Linux: a disconnected medium, or an operational status other than up or unknown (down, testing, dormant, not present or lower layer down). An unknown status or medium counts as up, and so does an alias that cannot be resolved or an entry that cannot be read, so a renamed adapter never keeps the node in Fault; the `bind` address check (§8) still applies. vipd then logs a warning, once per adapter, that it cannot read the adapter's link state. |
 
 - **`store=active`** means the VIP disappears when the machine reboots.
 - **`skipassource=true`** keeps outgoing traffic on the node's own IP.
