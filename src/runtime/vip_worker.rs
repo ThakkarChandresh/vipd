@@ -88,17 +88,20 @@ pub fn spawn<B: VipBackend>(
             };
             // A later attach or detach supersedes this one, and makes an announce before it moot.
             // Skipping them keeps a slow backend from replaying old terms after the election moved on.
-            if matches!(work, Work::Request(VipRequest::Attach(_) | VipRequest::Detach | VipRequest::Announce)) {
-                while let Ok(more) = rx.try_recv() {
-                    queue.push_back(more);
-                }
-                if queue.iter().any(|r| matches!(r, VipRequest::Attach(_) | VipRequest::Detach)) {
-                    continue;
-                }
+            if matches!(work, Work::Request(VipRequest::Attach(_) | VipRequest::Detach | VipRequest::Announce))
+                && attach_or_detach_waiting(&mut rx, &mut queue)
+            {
+                continue;
             }
             match work {
                 Work::RetryDetach => retry_at = retry_after(detach_all(&manager, &vips).await),
                 Work::Verify => {
+                    // A waiting attach or detach decides whether the VIPs are wanted, so it goes first.
+                    // Otherwise a verification could put back a VIP that the detach is about to remove.
+                    if attach_or_detach_waiting(&mut rx, &mut queue) {
+                        verify_at = Some(Instant::now() + verify_interval);
+                        continue;
+                    }
                     let verified = verify_all(&manager, &vips).await;
                     verify_at = Some(Instant::now() + verify_interval);
                     if !verified {
@@ -137,6 +140,14 @@ pub fn spawn<B: VipBackend>(
         }
     });
     (tx, handle)
+}
+
+/// Moves every waiting request into `queue`, and says whether an attach or detach is among them.
+fn attach_or_detach_waiting(rx: &mut mpsc::UnboundedReceiver<VipRequest>, queue: &mut VecDeque<VipRequest>) -> bool {
+    while let Ok(more) = rx.try_recv() {
+        queue.push_back(more);
+    }
+    queue.iter().any(|r| matches!(r, VipRequest::Attach(_) | VipRequest::Detach))
 }
 
 /// `None` if the detach succeeded, otherwise when to try it again.
@@ -365,6 +376,24 @@ mod tests {
         let calls = fake.calls();
         tokio::time::sleep(VERIFY * 3).await;
         assert_eq!(fake.calls(), calls, "the detached VIP was verified");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_verification_yields_to_a_queued_detach() {
+        for _ in 0..20 {
+            let (fake, tx, _events) = setup();
+            tx.send(VipRequest::Attach(1)).unwrap();
+            flush(&tx).await;
+            fake.remove_externally(VIP_IP);
+            let before = fake.calls().len();
+            // The verification falls due and wakes the worker, and a detach arrives before it runs.
+            // Sent first, the detach would be taken before the timer fires, and nothing would race.
+            tokio::time::advance(VERIFY + Duration::from_millis(1)).await;
+            tx.send(VipRequest::Detach).unwrap();
+            flush(&tx).await;
+            let after = &fake.calls()[before..];
+            assert!(!after.iter().any(|call| call.starts_with("attach")), "the VIP was added back: {after:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

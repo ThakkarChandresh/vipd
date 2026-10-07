@@ -167,7 +167,21 @@ pub async fn run<B: VipBackend>(
             worker_event = worker_events.recv() => match worker_event {
                 // Only the newest attach counts. An older one belongs to a term this node has since
                 // left, and the attach queued after it may still succeed.
-                Some(WorkerEvent::AttachFailed(id)) => (id == node.last_attach).then_some(Event::AttachFailed),
+                Some(WorkerEvent::AttachFailed(id)) if id != node.last_attach => None,
+                // A VIP may fail to be added because the network is down. The network check then moves
+                // the node to Fault itself, without the hold-down and the stop on preempting that a
+                // failed attach brings, which would keep the node from taking the VIP back once its
+                // network returns.
+                Some(WorkerEvent::AttachFailed(_)) => match network_problem(&cfg, &manager).await {
+                    Some(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            "a VIP could not be added while the network is down; waiting for the network check"
+                        );
+                        None
+                    }
+                    None => Some(Event::AttachFailed),
+                },
                 // The worker only stops this early if it panicked. Without it no VIP can move, so
                 // exit and let the service manager restart vipd; start-up removes any leftover VIP.
                 None => anyhow::bail!("the VIP worker stopped unexpectedly"),

@@ -455,7 +455,7 @@ A single `tokio::select!` loop over:
 - `sleep_until(next_deadline)`, which sends `TimerFired`;
 - the check-result channel, which updates check state and sends `HealthChanged` on a change;
 - a network check every advert interval (a tokio `Interval` that skips missed ticks), which updates the network state with its two-failure hysteresis (§8), logs a change, and sends `HealthChanged` if `Health` changes with it. The check runs after the tick, so the branch stays cancel-safe;
-- the VIP worker's event channel, which sends `AttachFailed`. If the channel closes, the worker has died (it stops early only if it panics). No VIP can move without it, so `run` returns an error (exit code 1); the service manager restarts vipd, and start-up removes any leftover VIP;
+- the VIP worker's event channel, which sends `AttachFailed`. If a network check run at once (§8) finds the network down, the failure is only logged: the network check then moves the node to Fault itself, without the hold-down and the preemption suspension that would keep it from taking the VIP back once the network returns. If the channel closes, the worker has died (it stops early only if it panics). No VIP can move without it, so `run` returns an error (exit code 1); the service manager restarts vipd, and start-up removes any leftover VIP;
 - the stop signal, which sends `Shutdown`.
 
 The loop carries out the resulting actions as follows.
@@ -478,6 +478,7 @@ A single task that owns the backend and processes requests in order, skipping th
 - **Verification.** While the VIPs are wanted, from a successful attach until a detach or a failed attach, the worker checks every 5 advert intervals (5 s by default) that they are still there, by running `ensure_attached` for each VIP.
   - A VIP that something else removed, such as NetworkManager clearing an interface, or an operator, is added back with the warning "the VIP was removed outside vipd; added it back". Then every VIP is announced again.
   - If a VIP cannot be checked or added back, the worker reports `AttachFailed` with the number of the attach that made the VIPs wanted. The runtime handles it as a failed attach (§5.5): the node goes to Fault with the hold-down, and the peer takes over.
+  - A verification that falls due while an attach or detach request is waiting is skipped, because that request decides whether the VIPs are wanted; otherwise it could put back and announce a VIP that a waiting detach is about to remove.
 - **Coalescing.** Before it runs an attach, detach or announce request, the worker takes every request already waiting. If a later attach or detach is among them, it skips the current one: that later request supersedes an attach or detach, and makes an announce moot. So a backend slower than the election (Windows' 3 s duplicate-address check, or slow overrides) does not replay a backlog of past terms, which would leave the VIP trailing the election by seconds and make a stop wait for the whole backlog. The shutdown flush (§11.4) is never skipped.
 
 ### 11.4 Shutdown
