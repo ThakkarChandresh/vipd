@@ -523,9 +523,9 @@ async fn a_vip_removed_from_the_master_is_added_back() {
 #[tokio::test]
 async fn an_attach_failure_while_the_network_is_down_does_not_stop_preemption() {
     let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 181), Ipv4Addr::new(127, 0, 0, 182)]);
-    // 200 ms heartbeats rather than 50: A's attach has to fail after its link goes down, but before
-    // its network check notices, at the third failed check in a row. The slower interval keeps
-    // that window far wider than any scheduling delay.
+    // 200 ms heartbeats rather than 50: A's second failed verification in a row has to come after its
+    // link goes down, but before its network check notices, at the third failed check in a row. The
+    // slower interval keeps that window far wider than any scheduling delay.
     let slow = |mut cfg: Config| {
         cfg.advert_interval_ms = 200;
         cfg
@@ -534,16 +534,17 @@ async fn an_attach_failure_while_the_network_is_down_does_not_stop_preemption() 
     let node_b = Node::start(slow(config(addrs[1], &[addrs[0]], 130)));
     wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
 
-    // The VIP disappears from A. A's next verification, 5 intervals after its attach, takes 100 ms
-    // to fail to add it back, and A's link goes down as soon as it starts, as when Wi-Fi drops.
-    // Taking the link down any earlier would not do: the network check would move A to Fault
-    // first, and the verification would never run.
+    // The VIP disappears from A, and every attach now takes 100 ms to fail. A's first verification,
+    // 5 intervals after its attach, fails with the link still up, and one failure is not reported.
+    // The link goes down as soon as the second one starts, as when Wi-Fi drops, so its failure, the
+    // second in a row, is reported while the link is down. Taking the link down any earlier would
+    // not do: the network check would move A to Fault first, and the verification would never run.
     let attaches = || node_a.fake.calls().iter().filter(|call| call.starts_with("attach")).count();
     let attached = attaches();
     node_a.fake.set_attach_delay(Duration::from_millis(100));
     node_a.fake.set_fail_attach(true);
     node_a.fake.remove_externally(VIP);
-    wait_until("A's verification starts adding the VIP back", || attaches() > attached).await;
+    wait_until("A's second verification starts adding the VIP back", || attaches() > attached + 1).await;
     node_a.fake.set_link_up(false);
     wait_until("B takes over", || node_b.holds_vip() && !node_a.holds_vip()).await;
 

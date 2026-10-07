@@ -29,7 +29,8 @@ pub enum VipRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerEvent {
-    /// The attach with this number failed, or a later check could not add back a VIP it attached.
+    /// The attach with this number failed, or checks after it failed twice in a row to add back a VIP
+    /// it attached.
     AttachFailed(u64),
 }
 
@@ -52,9 +53,10 @@ enum Work {
 /// skipped when a later attach or detach is already queued; a failed detach is retried every 2 s
 /// until it succeeds or an attach replaces it. From an attach until a detach, even after a failed
 /// attach, the VIPs are checked every `verify_interval`, unless an attach or detach is waiting: any
-/// that is missing is added and announced, and if that fails the worker reports `AttachFailed` with
-/// the number of the attach that made the VIPs wanted. The worker stops when every request sender
-/// is dropped, and `events` closes when it stops, so a caller can treat that as the worker dying.
+/// that is missing is added and announced. If that fails twice in a row, a failed attach counting
+/// as the first failure, the worker reports `AttachFailed` with the number of the attach that made
+/// the VIPs wanted. The worker stops when every request sender is dropped, and `events` closes when
+/// it stops, so a caller can treat that as the worker dying.
 pub fn spawn<B: VipBackend>(
     manager: Arc<VipManager<B>>,
     vips: Vec<Vip>,
@@ -70,6 +72,9 @@ pub fn spawn<B: VipBackend>(
         let mut retry_at: Option<Instant> = None;
         // When the wanted VIPs are next checked.
         let mut verify_at: Option<Instant> = None;
+        // Failed attaches and verifications in a row. A verification reports only the second, so
+        // one passing glitch in `find` or a re-add does not hand the VIP away until vipd restarts.
+        let mut failures = 0u32;
         let mut flushes = Vec::new();
         // Requests already taken off the channel, oldest first.
         let mut queue = VecDeque::new();
@@ -101,9 +106,10 @@ pub fn spawn<B: VipBackend>(
                         verify_at = Some(Instant::now() + verify_interval);
                         continue;
                     }
-                    let verified = verify_all(&manager, &vips).await;
+                    let verified = verify_all(&manager, &vips, failures > 0).await;
                     verify_at = Some(Instant::now() + verify_interval);
-                    if !verified {
+                    failures = if verified { 0 } else { failures.saturating_add(1) };
+                    if failures >= 2 {
                         // As for a failed attach: the node faults and the peer takes over.
                         let _ = events.send(WorkerEvent::AttachFailed(current_attach));
                     }
@@ -117,6 +123,9 @@ pub fn spawn<B: VipBackend>(
                     // is down is tried again, in case the network returns before its check notices.
                     let attached = attach_all(&manager, &vips).await;
                     verify_at = Some(Instant::now() + verify_interval);
+                    // A failed attach counts as the first failure, so a retry that fails too is
+                    // reported at once.
+                    failures = u32::from(!attached);
                     if !attached {
                         let _ = events.send(WorkerEvent::AttachFailed(id));
                     }
@@ -183,12 +192,18 @@ async fn attach_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> boo
     true
 }
 
-/// Adds back any VIP that something else removed, such as NetworkManager clearing an interface,
-/// and then announces them all. Returns false as soon as a VIP cannot be checked or added back.
-async fn verify_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip]) -> bool {
+/// Adds any VIP that is missing, and then announces them all. `retrying` says that the last attach or
+/// verification failed, so a VIP added now is that retry succeeding; otherwise something else, such
+/// as NetworkManager clearing an interface, removed it. Returns false as soon as a VIP cannot be
+/// checked or added.
+async fn verify_all<B: VipBackend>(manager: &VipManager<B>, vips: &[Vip], retrying: bool) -> bool {
     let mut added_back = false;
     for vip in vips {
         match manager.ensure_attached(vip).await {
+            Ok(true) if retrying => {
+                tracing::info!(vip = %vip.ip, interface = %vip.interface, "VIP attached on retry");
+                added_back = true;
+            }
             Ok(true) => {
                 tracing::warn!(
                     vip = %vip.ip,
@@ -268,6 +283,46 @@ mod tests {
         let (done, wait) = oneshot::channel();
         tx.send(VipRequest::Flush(done)).unwrap();
         wait.await.unwrap();
+    }
+
+    /// The log lines of this thread, which also runs the tasks of a `#[tokio::test]`.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Keeps a capture going until it is dropped.
+    struct Capturing {
+        _default: tracing::subscriber::DefaultGuard,
+        _idle: tracing::Dispatch,
+    }
+
+    impl Logs {
+        /// Collects this thread's log lines until the returned guard is dropped.
+        fn capture() -> (Self, Capturing) {
+            // tracing caches, for each log line, whether any subscriber wants it. While only one
+            // subscriber exists, it asks the default of whichever thread reaches the line first, and
+            // another test thread has none, so it would switch the line off on this thread too. A
+            // second, idle subscriber makes tracing ask both, and then check each event on its thread.
+            let idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let logs = Self::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+            (logs, Capturing { _default: tracing::subscriber::set_default(subscriber), _idle: idle })
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
     }
 
     #[tokio::test]
@@ -363,8 +418,55 @@ mod tests {
         flush(&tx).await;
         fake.remove_externally(VIP_IP);
         fake.set_fail_attach(true);
+        // One failed verification may be a passing glitch: only a second one in a row is reported.
+        tokio::time::sleep(VERIFY + Duration::from_millis(1)).await;
+        assert!(events.try_recv().is_err(), "a single failed verification was reported");
+        let event = tokio::time::timeout(VERIFY, events.recv()).await;
+        assert_eq!(event.expect("no event after two failed verifications"), Some(WorkerEvent::AttachFailed(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_failed_verification_followed_by_a_good_one_reports_nothing() {
+        let (fake, tx, mut events) = setup();
+        tx.send(VipRequest::Attach(1)).unwrap();
+        flush(&tx).await;
+        fake.remove_externally(VIP_IP);
+        fake.set_fail_attach(true);
+        tokio::time::sleep(VERIFY + Duration::from_millis(1)).await;
+        fake.set_fail_attach(false);
+        tokio::time::sleep(VERIFY).await;
+        assert!(fake.is_attached(VIP_IP), "the second verification did not add the VIP back");
+        // The good one starts the count over, so one more failure is not reported either.
+        fake.remove_externally(VIP_IP);
+        fake.set_fail_attach(true);
+        tokio::time::sleep(VERIFY).await;
+        assert!(events.try_recv().is_err(), "a failure was reported");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_retry_of_a_failed_attach_is_reported_at_once() {
+        // The failed attach counts as the first failure, so the failed retry is the second in a row.
+        let (fake, tx, mut events) = setup();
+        fake.set_fail_attach(true);
+        tx.send(VipRequest::Attach(3)).unwrap();
+        assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(3)));
         let event = tokio::time::timeout(VERIFY + Duration::from_millis(1), events.recv()).await;
-        assert_eq!(event.expect("no event within one verify interval"), Some(WorkerEvent::AttachFailed(7)));
+        assert_eq!(event.expect("the failed retry was not reported"), Some(WorkerEvent::AttachFailed(3)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_attach_is_not_logged_as_a_removal() {
+        let (logs, _guard) = Logs::capture();
+        let (fake, tx, mut events) = setup();
+        fake.set_fail_attach(true);
+        tx.send(VipRequest::Attach(3)).unwrap();
+        assert_eq!(events.recv().await, Some(WorkerEvent::AttachFailed(3)));
+        fake.set_fail_attach(false);
+        tokio::time::sleep(VERIFY + Duration::from_millis(1)).await;
+        assert!(fake.is_attached(VIP_IP), "the failed attach was not tried again");
+        let text = logs.text();
+        assert!(text.contains("VIP attached on retry"), "{text}");
+        assert!(!text.contains("removed outside vipd"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]

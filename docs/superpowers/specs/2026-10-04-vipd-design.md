@@ -184,7 +184,7 @@ Rows are checked from top to bottom, and the first row that matches wins. "Mine"
 | Fault | Heartbeat | Ignore it |
 | any | `Shutdown` | If Master: `SendHeartbeat(0)` and `DetachVips`. Then `RunHook(Stop)`. |
 
-- **Preemption suspension.** After a failed attach, the node stops preempting until it next becomes master on its own (its down timer runs out) or restarts. Until then a lower master's heartbeats keep it a backup, as with `preempt = false`. Otherwise a node that can never attach would take the VIP from a healthy master after every hold-down.
+- **Preemption suspension.** After a failed attach, the node stops preempting until it next becomes master on its own (its down timer runs out) or restarts. Until then a lower master's heartbeats keep it a backup, as with `preempt = false`. Otherwise a node that can never attach would take the VIP from a healthy master after every hold-down. A failed attach or verification reaches the machine only if the network check run at once finds the network up (§11.2); otherwise it is only logged, and starts neither the hold-down nor the suspension.
 
 ## 6. Wire protocol (`proto`)
 
@@ -470,15 +470,15 @@ The loop carries out the resulting actions as follows.
 A single task that owns the backend and processes requests in order, skipping those that a later request supersedes.
 
 - It holds a **desired state**: attached or detached.
-- **`AttachVips`** sets the desired state to *attached*, then runs `attach` and `announce` for each VIP. If any attach fails, it reports `AttachFailed`; the machine then emits `DetachVips`.
+- **`AttachVips`** sets the desired state to *attached*, then runs `attach` and `announce` for each VIP. If any attach fails, it reports `AttachFailed`; the machine then emits `DetachVips`, unless the network check run at once finds the network down (§11.2); then it is only logged.
   - Each attach request carries a number, one higher for every `AttachVips`, and `AttachFailed` carries the number of the attach that failed. The runtime passes the failure to the machine only if it belongs to the newest attach. An older one belongs to a master term the node has since left, and the attach queued after it may still succeed, so it must not fault the current term.
   - On Linux, `announce` sends the first burst of gratuitous ARPs.
 - **`DetachVips`** sets the desired state to *detached* and runs `detach` for each VIP.
   - If detach fails, it retries every 2 s, logging an error each time, until it succeeds or the desired state changes.
 - **`Announce`** runs `announce` for each VIP only if the desired state is *attached*.
 - **Verification.** While the VIPs are wanted, from an attach until a detach, the worker checks every 5 advert intervals (5 s by default) that they are there, by running `ensure_attached` for each VIP; after a failed attach that the runtime ignored because the network was down (§11.2), this tries the attach again, in case the network returns before the network check notices.
-  - A VIP that something else removed, such as NetworkManager clearing an interface, or an operator, is added back with the warning "the VIP was removed outside vipd; added it back". Then every VIP is announced again.
-  - If a VIP cannot be checked or added back, the worker reports `AttachFailed` with the number of the attach that made the VIPs wanted. The runtime handles it as a failed attach (§5.5): the node goes to Fault with the hold-down, and the peer takes over.
+  - A VIP that something else removed, such as NetworkManager clearing an interface, or an operator, is added back with the warning "the VIP was removed outside vipd; added it back". Then every VIP is announced again. A VIP added by a verification that retries a failed attach or verification is logged as "VIP attached on retry" instead, at info level.
+  - If a VIP cannot be checked or added back on two verifications in a row, the worker reports `AttachFailed` with the number of the attach that made the VIPs wanted. One failure may be a passing glitch, and on Windows the verification runs netsh about 17,000 times a day. A failed attach counts as the first failure, so a retry that fails after it is reported at once. The runtime handles the report as a failed attach (§5.5): the node goes to Fault with the hold-down, and the peer takes over, unless the network check run at once finds the network down (§11.2); then it is only logged.
   - A verification that falls due while an attach or detach request is waiting is skipped, because that request decides whether the VIPs are wanted; otherwise it could put back and announce a VIP that a waiting detach is about to remove.
 - **Coalescing.** Before it runs an attach, detach or announce request, the worker takes every request already waiting. If a later attach or detach is among them, it skips the current one: that later request supersedes an attach or detach, and makes an announce moot. So a backend slower than the election (Windows' 3 s duplicate-address check, or slow overrides) does not replay a backlog of past terms, which would leave the VIP trailing the election by seconds and make a stop wait for the whole backlog. The shutdown flush (§11.4) is never skipped.
 
@@ -522,7 +522,7 @@ On Linux, the `service` subcommands print an error that points to `packaging/vip
 |---|---|
 | A packet is malformed, forged, from the wrong group or replayed | Dropped, with a rate-limited warning. Never a crash. |
 | A VIP command hangs | Killed after 10 s and counted as a failure |
-| Attach fails | The machine goes to Fault with a 10 s hold-down, and stops preempting until it next becomes master on its own or restarts (§5.5) |
+| Attach fails, or two verifications in a row cannot check or add back a VIP (§11.3) | The machine goes to Fault with a 10 s hold-down, and stops preempting until it next becomes master on its own or restarts (§5.5), unless the network check run at once finds the network down (§11.2); then it is only logged |
 | Detach fails | Retried every 2 s, with loud errors, until it succeeds (§11.3) |
 | The process panics or crashes, or the VIP worker dies (§11.2) | systemd or the SCM restarts it, and the start-up cleanup (§11.1 step 3) removes any leftover VIP |
 | A stop cannot remove the VIPs within 15 s | Logged, and exit code 1 (§11.4); the Windows service still reports 0. The VIP may still be attached, and nothing restarts vipd after a requested stop. |
