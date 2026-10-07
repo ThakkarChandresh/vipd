@@ -524,8 +524,8 @@ async fn a_vip_removed_from_the_master_is_added_back() {
 async fn an_attach_failure_while_the_network_is_down_does_not_stop_preemption() {
     let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 181), Ipv4Addr::new(127, 0, 0, 182)]);
     // 200 ms heartbeats rather than 50: A's attach has to fail after its link goes down, but before
-    // its network check notices two intervals later. The slower interval keeps that window far
-    // wider than any scheduling delay.
+    // its network check notices, at the third failed check in a row. The slower interval keeps
+    // that window far wider than any scheduling delay.
     let slow = |mut cfg: Config| {
         cfg.advert_interval_ms = 200;
         cfg

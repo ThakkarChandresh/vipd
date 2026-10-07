@@ -296,7 +296,7 @@ How the gratuitous ARP is sent:
 | attach | `netsh interface ipv4 add address "{iface}" {ip} {mask} store=active skipassource=true`, then the duplicate-address check below |
 | detach | `netsh interface ipv4 delete address "{iface}" {ip} store=active` |
 | announce | No-op. Windows announces a new address itself; this is to be verified (§15). |
-| link | Always up. Windows clears a disconnected adapter's addresses, so the `bind` address check (§8) notices instead, without running netsh or PowerShell every advert interval. |
+| link | Always up. Windows clears a disconnected adapter's addresses, so the `bind` address check (§8) notices a lost network instead, without running netsh or PowerShell every advert interval. That works only when the `bind` address is on the VIP's adapter. |
 
 - **`store=active`** means the VIP disappears when the machine reboots.
 - **`skipassource=true`** keeps outgoing traffic on the node's own IP.
@@ -354,7 +354,8 @@ How the gratuitous ARP is sent:
   - **or, on Linux, a VIP interface's link is down:** `/sys/class/net/{iface}/operstate` cannot be read, or reads anything but `up` or `unknown`, such as `down`, `dormant` (Wi-Fi not associated) or `lowerlayerdown`. `unknown` counts as up because loopback, dummy and some drivers never report more. Windows does not check the link (§7.3).
 
   How the runtime uses it:
-  - **Hysteresis.** The network is tracked like a check with `fall = 2` and `rise = 1`: it counts as down only after two failed checks in a row, so one bad sample (a Wi-Fi interface briefly `dormant` while it re-keys) does not cause a failover, and as up again on the first good check. The start-up check decides on its own, as a check's first result does, so a node whose network is down at start starts in Fault.
+  - **Hysteresis.** The network is tracked like a check with `fall = 3` and `rise = 1`: it counts as down only after three failed checks in a row, and as up again on the first good check. So a blip shorter than about two advert intervals (a Wi-Fi interface briefly `dormant` while it re-keys) moves nothing, and a real loss is noticed within about three. With `fall = 2`, a blip of one to two and a half intervals would fault the master, the peer would take over, and the master would preempt it back afterwards: two moves for nothing.
+  - **At start-up.** The first check decides on its own, as a check's first result does, so a node whose VIP interface's link is down at start starts in Fault. A `bind` address that is gone at start stops vipd before that: the bind fails and vipd exits with code 1 (§11.1), and the service manager starts it again (systemd every 2 s, the Windows service after 5 s, 5 s, then every minute).
   - **On loss.** vipd logs "the network is down: this node leaves the election until it is back", with the reason. `Health` goes into fault, with the effective priority still set by the checks, so the node leaves the election as for a failing weight-0 check (§5.5): a master says goodbye (which may not get out), detaches the VIPs and runs `on_fault`, and a backup goes to Fault and runs `on_fault`. The peer takes over when its down timer runs out, or after its skew if the goodbye got through.
   - **On return.** vipd logs "the network is back", and the node becomes a backup again and rejoins the election, unless a failing weight-0 check or the hold-down after a failed attach still keeps it in Fault (§5.5). With the highest priority and `preempt` on, it takes the VIP back and attaches it again, even if something removed it meanwhile.
 
@@ -454,7 +455,7 @@ A single `tokio::select!` loop over:
 - UDP receive, which is decoded, validated and sent to the machine as `Heartbeat`;
 - `sleep_until(next_deadline)`, which sends `TimerFired`;
 - the check-result channel, which updates check state and sends `HealthChanged` on a change;
-- a network check every advert interval (a tokio `Interval` that skips missed ticks), which updates the network state with its two-failure hysteresis (§8), logs a change, and sends `HealthChanged` if `Health` changes with it. The check runs after the tick, so the branch stays cancel-safe;
+- a network check every advert interval (a tokio `Interval` that skips missed ticks), which updates the network state with its three-failure hysteresis (§8), logs a change, and sends `HealthChanged` if `Health` changes with it. The check runs after the tick, so the branch stays cancel-safe;
 - the VIP worker's event channel, which sends `AttachFailed`. If a network check run at once (§8) finds the network down, the failure is only logged: the network check then moves the node to Fault itself, without the hold-down and the preemption suspension that would keep it from taking the VIP back once the network returns. If the channel closes, the worker has died (it stops early only if it panics). No VIP can move without it, so `run` returns an error (exit code 1); the service manager restarts vipd, and start-up removes any leftover VIP;
 - the stop signal, which sends `Shutdown`.
 

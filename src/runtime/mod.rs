@@ -79,10 +79,9 @@ pub async fn run<B: VipBackend>(
         () = &mut shutdown => return Ok(()),
         states = first_check_round(&cfg) => states?,
     };
-    // The network is tracked like a check with fall = 2 and rise = 1, so one bad sample (a Wi-Fi
-    // interface briefly `dormant` while it re-keys) does not cause a failover (spec §8). As with a
-    // check, the first result decides on its own: a node whose network is down starts in Fault.
-    let mut network = CheckState::new(2, 1);
+    // As with a check, the first result decides on its own: a node whose VIP interface's link is down
+    // starts in Fault. A `bind` address that is gone has already stopped start-up at the bind above.
+    let mut network = network_tracker();
     let problem = network_problem(&cfg, &manager).await;
     if let Some(reason) = &problem {
         log_network_down(reason);
@@ -297,6 +296,14 @@ impl Drop for CheckLoops {
 fn random_u16() -> u16 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish() as u16
+}
+
+/// The network's state, tracked like a check with fall = 3 and rise = 1 (spec §8). It counts as down
+/// only after three failed checks in a row, so a blip shorter than about two advert intervals (a
+/// Wi-Fi interface briefly `dormant` while it re-keys) moves nothing, and as up again after one good
+/// check.
+fn network_tracker() -> CheckState {
+    CheckState::new(3, 1)
 }
 
 /// The checks' health, in fault while the network is down. The checks still set the priority.
@@ -525,6 +532,24 @@ interface = "fake0"
     #[test]
     fn an_address_of_this_machine_is_present() {
         assert!(bind_ip_present(Ipv4Addr::LOCALHOST));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_address_of_another_machine_is_not_present() {
+        // TEST-NET-1 is never local, unless ip_nonlocal_bind lets any bind succeed.
+        let nonlocal = std::fs::read_to_string("/proc/sys/net/ipv4/ip_nonlocal_bind").is_ok_and(|v| v.trim() == "1");
+        assert_eq!(bind_ip_present(Ipv4Addr::new(192, 0, 2, 1)), nonlocal);
+    }
+
+    #[test]
+    fn the_network_is_down_after_three_bad_checks_and_back_after_one() {
+        let mut n = network_tracker();
+        n.record(true);
+        assert!(!n.record(false));
+        assert!(!n.record(false));
+        assert!(n.record(false));
+        assert!(n.record(true));
     }
 
     #[test]
