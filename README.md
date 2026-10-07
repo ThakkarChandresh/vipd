@@ -11,6 +11,8 @@ The design is in [docs/superpowers/specs/2026-10-04-vipd-design.md](docs/superpo
 
 ## Build
 
+Prebuilt binaries for x86_64 Linux and Windows are on the [releases page](https://github.com/ThakkarChandresh/vipd/releases). The Linux one is static, so it runs on any distro. To build it yourself:
+
 ```bash
 cargo build --release
 ```
@@ -116,3 +118,14 @@ One test needs root, because it adds an address to a temporary dummy interface, 
 cargo test --lib --no-run
 sudo target/debug/deps/vipd-<hash> vip::linux --ignored
 ```
+
+## Release
+
+Set `version` in `Cargo.toml`, commit, then push a matching tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The [release workflow](.github/workflows/release.yml) checks that the tag matches `Cargo.toml`, runs clippy and the tests on Linux and Windows, and publishes a GitHub Release with `vipd-v0.1.0-x86_64-linux.tar.gz`, `vipd-v0.1.0-x86_64-windows.zip` and `SHA256SUMS`. If any step fails, nothing is published; delete the tag (`git push --delete origin v0.1.0` and `git tag -d v0.1.0`), fix the problem and tag again.
