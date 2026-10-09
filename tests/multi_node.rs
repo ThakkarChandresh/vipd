@@ -96,8 +96,12 @@ impl Node {
     }
 }
 
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+async fn wait_until(what: &str, condition: impl FnMut() -> bool) {
+    wait_until_within(what, Duration::from_secs(5), condition).await;
+}
+
+async fn wait_until_within(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
     while !condition() {
         assert!(tokio::time::Instant::now() < deadline, "timed out waiting for: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -470,4 +474,87 @@ async fn a_clean_stop_is_not_stuck_behind_a_backlog() {
     let _ = node.stop.send(());
     let result = node.task.await.unwrap();
     assert!(result.is_ok(), "the stop failed after {:.1} s: {result:?}", started.elapsed().as_secs_f64());
+}
+
+#[tokio::test]
+async fn a_master_that_loses_its_network_hands_over_and_takes_the_vip_back() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 151), Ipv4Addr::new(127, 0, 0, 152)]);
+    // Preemption is on by default.
+    let node_a = Node::start(config(addrs[0], &[addrs[1]], 150));
+    let node_b = Node::start(config(addrs[1], &[addrs[0]], 130));
+    wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    // Wi-Fi goes off on A: its link goes down, and NetworkManager clears the VIP. Heartbeats still
+    // flow over loopback here, but A, in Fault, sends none and ignores B's.
+    node_a.fake.set_link_up(false);
+    node_a.fake.remove_externally(VIP);
+    wait_until("B takes over", || node_b.holds_vip() && !node_a.holds_vip()).await;
+
+    // Wi-Fi comes back, without the VIP. A rejoins and, with the higher priority, takes it back.
+    node_a.fake.set_link_up(true);
+    wait_until("A takes the VIP back", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    node_a.stop().await;
+    node_b.stop().await;
+}
+
+#[tokio::test]
+async fn a_vip_removed_from_the_master_is_added_back() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 161), Ipv4Addr::new(127, 0, 0, 162)]);
+    let node_a = Node::start(config(addrs[0], &[addrs[1]], 150));
+    let node_b = Node::start(config(addrs[1], &[addrs[0]], 130));
+    wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    // Something else removes the VIP from A, which stays master. Its VIP worker checks every 5
+    // advert intervals, 250 ms here, so the VIP is back well within a second.
+    node_a.fake.remove_externally(VIP);
+    let a_holds_it = || {
+        assert!(!node_b.holds_vip(), "B took the VIP");
+        node_a.holds_vip()
+    };
+    wait_until_within("A adds the VIP back", Duration::from_secs(1), a_holds_it).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(a_holds_it(), "A lost the VIP again");
+
+    node_a.stop().await;
+    node_b.stop().await;
+}
+
+#[tokio::test]
+async fn an_attach_failure_while_the_network_is_down_does_not_stop_preemption() {
+    let addrs = free_addrs(&[Ipv4Addr::new(127, 0, 0, 181), Ipv4Addr::new(127, 0, 0, 182)]);
+    // 200 ms heartbeats rather than 50: A's second failed verification in a row has to come after its
+    // link goes down, but before its network check notices, at the third failed check in a row. The
+    // slower interval keeps that window far wider than any scheduling delay.
+    let slow = |mut cfg: Config| {
+        cfg.advert_interval_ms = 200;
+        cfg
+    };
+    let node_a = Node::start(slow(config(addrs[0], &[addrs[1]], 150)));
+    let node_b = Node::start(slow(config(addrs[1], &[addrs[0]], 130)));
+    wait_until("A becomes master", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    // The VIP disappears from A, and every attach now takes 100 ms to fail. A's first verification,
+    // 5 intervals after its attach, fails with the link still up, and one failure is not reported.
+    // The link goes down as soon as the second one starts, as when Wi-Fi drops, so its failure, the
+    // second in a row, is reported while the link is down. Taking the link down any earlier would
+    // not do: the network check would move A to Fault first, and the verification would never run.
+    let attaches = || node_a.fake.calls().iter().filter(|call| call.starts_with("attach")).count();
+    let attached = attaches();
+    node_a.fake.set_attach_delay(Duration::from_millis(100));
+    node_a.fake.set_fail_attach(true);
+    node_a.fake.remove_externally(VIP);
+    wait_until("A's second verification starts adding the VIP back", || attaches() > attached + 1).await;
+    node_a.fake.set_link_up(false);
+    wait_until("B takes over", || node_b.holds_vip() && !node_a.holds_vip()).await;
+
+    // The network returns. Had the failed attach counted, A would sit out a 10 s hold-down and then
+    // stop preempting, so taking the VIP back within seconds shows that it did not.
+    node_a.fake.set_fail_attach(false);
+    node_a.fake.set_attach_delay(Duration::ZERO);
+    node_a.fake.set_link_up(true);
+    wait_until("A takes the VIP back", || node_a.holds_vip() && !node_b.holds_vip()).await;
+
+    node_a.stop().await;
+    node_b.stop().await;
 }

@@ -1,5 +1,6 @@
 //! Windows backend: `netsh` commands, plus a PowerShell duplicate-address check after attaching
-//! (spec §7.3). Everything except the trait implementation is a pure function tested on any OS.
+//! (spec §7.3). Everything except the trait implementation and the link check is a pure function
+//! tested on any OS.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -104,6 +105,90 @@ pub fn output_has_ip(output: &str, ip: Ipv4Addr) -> bool {
     output.split_whitespace().any(|token| token == wanted)
 }
 
+/// windows-sys's `IfOperStatus*` and `MediaConnectState*` values, from
+/// `windows_sys::Win32::NetworkManagement::Ndis`. They are here so that `link_state_is_up` compiles
+/// and is tested on any OS; on Windows, the asserts below compare them with windows-sys's own.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ndis {
+    pub const UP: i32 = 1;
+    pub const DOWN: i32 = 2;
+    pub const TESTING: i32 = 3;
+    pub const UNKNOWN: i32 = 4;
+    pub const DORMANT: i32 = 5;
+    pub const NOT_PRESENT: i32 = 6;
+    pub const LOWER_LAYER_DOWN: i32 = 7;
+    pub const MEDIA_UNKNOWN: i32 = 0;
+    pub const MEDIA_CONNECTED: i32 = 1;
+    pub const MEDIA_DISCONNECTED: i32 = 2;
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows_sys::Win32::NetworkManagement::Ndis as sys;
+    assert!(ndis::UP == sys::IfOperStatusUp);
+    assert!(ndis::DOWN == sys::IfOperStatusDown);
+    assert!(ndis::TESTING == sys::IfOperStatusTesting);
+    assert!(ndis::UNKNOWN == sys::IfOperStatusUnknown);
+    assert!(ndis::DORMANT == sys::IfOperStatusDormant);
+    assert!(ndis::NOT_PRESENT == sys::IfOperStatusNotPresent);
+    assert!(ndis::LOWER_LAYER_DOWN == sys::IfOperStatusLowerLayerDown);
+    assert!(ndis::MEDIA_UNKNOWN == sys::MediaConnectStateUnknown);
+    assert!(ndis::MEDIA_CONNECTED == sys::MediaConnectStateConnected);
+    assert!(ndis::MEDIA_DISCONNECTED == sys::MediaConnectStateDisconnected);
+};
+
+/// Whether an adapter's link counts as up, from the operational status and media-connect state that
+/// `GetIfEntry2` reports. Only positive evidence counts as down, as on Linux, where `unknown` is up:
+/// a disconnected medium, or a status other than up or unknown (down, testing, dormant, not present
+/// or lower layer down).
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows calls it, but its test runs on any OS
+fn link_state_is_up(oper_status: i32, media_state: i32) -> bool {
+    media_state != ndis::MEDIA_DISCONNECTED && matches!(oper_status, ndis::UP | ndis::UNKNOWN)
+}
+
+/// Whether the adapter's link is up, as `link_state_is_up` decides from what the IP Helper API
+/// reports: two system calls, not a netsh or PowerShell process, every advert interval. Switching
+/// Wi-Fi off leaves the adapter's address in place, so only this notices. An alias that cannot be
+/// resolved, or an entry that cannot be read, counts as up ("cannot tell", see
+/// `VipBackend::link_up`): the bind-address check still applies, and a renamed adapter must never
+/// keep a node in Fault for good. That case is logged once per adapter, so it is not silent.
+#[cfg(windows)]
+fn adapter_connected(alias: &str) -> bool {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, GetIfEntry2, MIB_IF_ROW2};
+
+    let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives both calls. `row` is plain data, for which all
+    // zeroes is a valid value, and both calls only write into it through pointers to it that do not
+    // outlive this block.
+    unsafe {
+        let mut row: MIB_IF_ROW2 = std::mem::zeroed();
+        if ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut row.InterfaceLuid) == NO_ERROR
+            && GetIfEntry2(&mut row) == NO_ERROR
+        {
+            return link_state_is_up(row.OperStatus, row.MediaConnectState);
+        }
+    }
+    // Said once per adapter: a name Windows does not know would otherwise switch the check off silently.
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|known| known == alias) {
+        warned.push(alias.to_owned());
+        tracing::warn!(
+            interface = %alias,
+            "cannot read this adapter's link state, so a lost link is not noticed; check the name, including its case"
+        );
+    }
+    true
+}
+
+/// Off Windows this backend is only compiled and unit-tested, and cannot ask Windows about an
+/// adapter, so it says yes, as a backend that cannot tell does.
+#[cfg(not(windows))]
+fn adapter_connected(_alias: &str) -> bool {
+    true
+}
+
 impl VipBackend for WindowsBackend {
     async fn interface_exists(&self, iface: &str) -> anyhow::Result<bool> {
         Ok(exec::run(&interface_args(iface), COMMAND_TIMEOUT, &[]).await?.success)
@@ -165,6 +250,10 @@ impl VipBackend for WindowsBackend {
         // Windows announces a newly added address itself (to be confirmed on hardware, spec §15).
         Ok(())
     }
+
+    async fn link_up(&self, iface: &str) -> bool {
+        adapter_connected(iface)
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +294,26 @@ mod tests {
         assert_eq!(parse_address_state(""), AddressState::Missing);
         assert_eq!(parse_address_state("Tentative"), AddressState::Tentative);
         assert_eq!(parse_address_state("Deprecated"), AddressState::Other("Deprecated".into()));
+    }
+
+    #[test]
+    fn only_positive_evidence_makes_a_windows_link_down() {
+        use ndis::*;
+        assert!(link_state_is_up(UP, MEDIA_CONNECTED));
+        assert!(link_state_is_up(UP, MEDIA_UNKNOWN));
+        assert!(link_state_is_up(UNKNOWN, MEDIA_UNKNOWN));
+        assert!(!link_state_is_up(UP, MEDIA_DISCONNECTED));
+        for down in [DOWN, TESTING, DORMANT, NOT_PRESENT, LOWER_LAYER_DOWN] {
+            assert!(!link_state_is_up(down, MEDIA_CONNECTED), "status {down}");
+        }
+    }
+
+    /// Runs only on Windows, in the release CI.
+    #[cfg(windows)]
+    #[test]
+    fn an_adapter_windows_does_not_know_counts_as_connected() {
+        // The FFI path runs, and "cannot tell" is up, so a renamed adapter never keeps a node in Fault.
+        assert!(adapter_connected("vipd-no-such-adapter"));
     }
 
     #[test]

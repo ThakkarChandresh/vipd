@@ -30,10 +30,8 @@ A small Rust daemon that keeps one virtual IP (VIP) alive across two or more mac
 - IPv6
 - Multiple VIP groups per node
 - Multicast discovery
-- Interface link tracking
 - macOS
 - Config reload without restart
-- Detecting a VIP removed by hand while MASTER
 - A status or metrics endpoint
 - A native gratuitous-ARP announcer on Windows (see §15)
 
@@ -54,7 +52,7 @@ A small Rust daemon that keeps one virtual IP (VIP) alive across two or more mac
 | `proto` | Packet encode and decode, the HMAC, and replay tracking | `hmac`, `sha2` |
 | `exec` | The command tokenizer (§7.4), and running a command without a shell, with a timeout | tokio, `libc` (Linux only) |
 | `checks` | Pure rise/fall state and health aggregation, plus an async runner that executes the check commands | `election` (for `Health`), `exec`, tokio |
-| `vip` | The `VipBackend` trait, `VipManager` and `CommandOverrides` (the `[vip_commands]` overrides), a Linux backend (`ip` plus gratuitous ARP via `libc`), a Windows backend (`netsh`) and a fake backend for tests | `exec`, tokio, `libc` (Linux only) |
+| `vip` | The `VipBackend` trait, `VipManager` and `CommandOverrides` (the `[vip_commands]` overrides), a Linux backend (`ip` plus gratuitous ARP via `libc`), a Windows backend (`netsh`, and the IP Helper API for the link) and a fake backend for tests | `exec`, tokio, `libc` (Linux only), `windows-sys` (Windows only) |
 | `runtime` | The event loop, the VIP worker and hook execution | everything above |
 | `service` | The Windows service: install, uninstall and the SCM entry point | `windows-service` (Windows only) |
 | `config` | Loading and validating the TOML | `checks`, `exec`, `proto`, `vip`, `serde`, `toml` |
@@ -101,6 +99,7 @@ docs/superpowers/specs/2026-10-04-vipd-design.md
   - A check with a **negative** weight contributes that weight while it is failing.
   - A check with a **positive** weight contributes that weight while it is passing.
   - A check with weight **0** contributes nothing. Instead, while it is failing the node is in Fault.
+- **The network.** The node is also in Fault while its network is down: its `bind` address is gone, or a VIP interface's link is down (§8). The checks still set its effective priority meanwhile.
 
 ### 5.2 Timers
 
@@ -185,7 +184,7 @@ Rows are checked from top to bottom, and the first row that matches wins. "Mine"
 | Fault | Heartbeat | Ignore it |
 | any | `Shutdown` | If Master: `SendHeartbeat(0)` and `DetachVips`. Then `RunHook(Stop)`. |
 
-- **Preemption suspension.** After a failed attach, the node stops preempting until it next becomes master on its own (its down timer runs out) or restarts. Until then a lower master's heartbeats keep it a backup, as with `preempt = false`. Otherwise a node that can never attach would take the VIP from a healthy master after every hold-down.
+- **Preemption suspension.** After a failed attach, the node stops preempting until it next becomes master on its own (its down timer runs out) or restarts. Until then a lower master's heartbeats keep it a backup, as with `preempt = false`. Otherwise a node that can never attach would take the VIP from a healthy master after every hold-down. A failed attach or verification reaches the machine only if the network check run at once finds the network up (§11.2); otherwise it is only logged, and starts neither the hold-down nor the suspension.
 
 ## 6. Wire protocol (`proto`)
 
@@ -260,6 +259,7 @@ pub trait VipBackend: Send + Sync + 'static {
     async fn attach(&self, vip: &Vip) -> anyhow::Result<()>;               // only called when find() is None
     async fn detach(&self, vip: &Vip, found: &str) -> anyhow::Result<()>;  // found: what find() returned
     async fn announce(&self, vip: &Vip) -> anyhow::Result<()>;             // no-op where the OS announces
+    async fn link_up(&self, iface: &str) -> bool;                          // yes where the backend cannot tell (§8)
 }
 ```
 
@@ -276,6 +276,7 @@ pub trait VipBackend: Send + Sync + 'static {
 | attach | `ip addr add {ip}/{prefix} dev {iface}` |
 | detach | `ip addr del {found} dev {iface}`, using the prefix that `find` actually returned |
 | announce | Native gratuitous ARP (`garp.rs`), described below |
+| link | Up while `/sys/class/net/{iface}/operstate` reads `up` or `unknown` (§8) |
 
 How the gratuitous ARP is sent:
 - A `socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ARP))`, with the interface index from `if_nametoindex`. Close-on-exec keeps checks and hooks started meanwhile from inheriting it.
@@ -295,6 +296,7 @@ How the gratuitous ARP is sent:
 | attach | `netsh interface ipv4 add address "{iface}" {ip} {mask} store=active skipassource=true`, then the duplicate-address check below |
 | detach | `netsh interface ipv4 delete address "{iface}" {ip} store=active` |
 | announce | No-op. Windows announces a new address itself; this is to be verified (§15). |
+| link | Read through the IP Helper API: `ConvertInterfaceAliasToLuid`, then `GetIfEntry2`. These are system calls, so no netsh or PowerShell process runs every advert interval. Only positive evidence counts as down, as on Linux: a disconnected medium, or an operational status other than up or unknown (down, testing, dormant, not present or lower layer down). An unknown status or medium counts as up, and so does an alias that cannot be resolved or an entry that cannot be read, so a renamed adapter never keeps the node in Fault; the `bind` address check (§8) still applies. vipd then logs a warning, once per adapter, that it cannot read the adapter's link state. |
 
 - **`store=active`** means the VIP disappears when the machine reboots.
 - **`skipassource=true`** keeps outgoing traffic on the node's own IP.
@@ -347,6 +349,15 @@ How the gratuitous ARP is sent:
 - **Aggregation.** `aggregate(base, &checks) -> Health` computes §5.1.
   - The runtime sends `HealthChanged` only when `Health` actually changes.
 - **Start-up.** Every check runs once, concurrently, and each run is bounded by its own timeout. The machine starts only after all of them finish (§11.1).
+- **Network tracking.** Besides the checks, the runtime checks this node's network once at start-up, after the first round of checks, and then every advert interval (§11.2). Each check is one bind, and one link query per VIP: a file read on Linux, two IP Helper calls on Windows. The network is down when:
+  - **the `bind` address is gone:** binding a UDP socket to it, on port 0, fails. NetworkManager clears a Wi-Fi interface's addresses when it loses its network. Windows keeps an adapter's address when Wi-Fi is switched off, so there the link check is what notices. On a host with `net.ipv4.ip_nonlocal_bind=1` this check always passes, and only the link check applies;
+  - **or a VIP interface's link is down.** On Linux, `/sys/class/net/{iface}/operstate` cannot be read, or reads anything but `up` or `unknown`, such as `down`, `dormant` (Wi-Fi not associated) or `lowerlayerdown`; `unknown` counts as up because loopback, dummy and some drivers never report more. On Windows, the IP Helper API (`GetIfEntry2`) reports the adapter's medium as disconnected, or its operational status as anything but up or unknown; as on Linux, unknown counts as up, and so does an alias that cannot be resolved (§7.3).
+
+  How the runtime uses it:
+  - **Hysteresis.** The network is tracked like a check with `fall = 3` and `rise = 1`: it counts as down only after three failed checks in a row, and as up again on the first good check. So a blip shorter than about two advert intervals (a Wi-Fi interface briefly `dormant` while it re-keys) moves nothing, and a real loss is noticed within about three. With `fall = 2`, a blip of one to two and a half intervals would fault the master, the peer would take over, and the master would preempt it back afterwards: two moves for nothing.
+  - **At start-up.** The first check decides on its own, as a check's first result does, so a node whose VIP interface's link is down at start starts in Fault. A `bind` address that is gone at start stops vipd before that: the bind fails and vipd exits with code 1 (§11.1), and the service manager starts it again (systemd every 2 s, the Windows service after 5 s, 5 s, then every minute).
+  - **On loss.** vipd logs "the network is down: this node leaves the election until it is back", with the reason. `Health` goes into fault, with the effective priority still set by the checks, so the node leaves the election as for a failing weight-0 check (§5.5): a master says goodbye (which may not get out), detaches the VIPs and runs `on_fault`, and a backup goes to Fault and runs `on_fault`. The peer takes over when its down timer runs out, or after its skew if the goodbye got through.
+  - **On return.** vipd logs "the network is back", and the node becomes a backup again and rejoins the election, unless a failing weight-0 check or the hold-down after a failed attach still keeps it in Fault (§5.5). With the highest priority and `preempt` on, it takes the VIP back and attaches it again, even if something removed it meanwhile.
 
 ## 9. Hooks
 
@@ -429,7 +440,7 @@ on_master = "/usr/local/bin/vip-alert.sh master"
 2. Check that every VIP's interface exists (§10). If one does not, step 3 still runs, and then vipd exits with code 1 and this error. Otherwise one missing interface would leave the VIPs that a crash left on the other interfaces next to the peer's, while the service manager restarts vipd again and again.
 3. Run `detach` for every configured VIP, cleaning up after a crash. A VIP that cannot be detached does not stop the others from being tried. If any fails, exit with code 1, because the node is not safe to run. Each VIP removed is logged as a warning.
 4. Bind the UDP socket (attempted before step 2). If the port is already in use, vipd exits with code 1 before step 2, without the cleanup: most likely another vipd runs on this node, and step 3 would remove the VIPs it holds. Any other bind failure, such as a `bind` IP that is gone, is reported here, after step 3, so it does not skip the cleanup.
-5. Run the first round of checks and compute `Health`.
+5. Run the first round of checks, check the network once (§8), and compute `Health`.
 6. Create the `Machine` and feed it `Started { health }`.
 7. Enter the event loop.
 
@@ -444,7 +455,8 @@ A single `tokio::select!` loop over:
 - UDP receive, which is decoded, validated and sent to the machine as `Heartbeat`;
 - `sleep_until(next_deadline)`, which sends `TimerFired`;
 - the check-result channel, which updates check state and sends `HealthChanged` on a change;
-- the VIP worker's event channel, which sends `AttachFailed`. If the channel closes, the worker has died (it stops early only if it panics). No VIP can move without it, so `run` returns an error (exit code 1); the service manager restarts vipd, and start-up removes any leftover VIP;
+- a network check every advert interval (a tokio `Interval` that skips missed ticks), which updates the network state with its three-failure hysteresis (§8), logs a change, and sends `HealthChanged` if `Health` changes with it. The check runs after the tick, so the branch stays cancel-safe;
+- the VIP worker's event channel, which sends `AttachFailed`. If a network check run at once (§8) finds the network down, the failure is only logged: the network check then moves the node to Fault itself, without the hold-down and the preemption suspension that would keep it from taking the VIP back once the network returns. If the channel closes, the worker has died (it stops early only if it panics). No VIP can move without it, so `run` returns an error (exit code 1); the service manager restarts vipd, and start-up removes any leftover VIP;
 - the stop signal, which sends `Shutdown`.
 
 The loop carries out the resulting actions as follows.
@@ -458,12 +470,16 @@ The loop carries out the resulting actions as follows.
 A single task that owns the backend and processes requests in order, skipping those that a later request supersedes.
 
 - It holds a **desired state**: attached or detached.
-- **`AttachVips`** sets the desired state to *attached*, then runs `attach` and `announce` for each VIP. If any attach fails, it reports `AttachFailed`; the machine then emits `DetachVips`.
+- **`AttachVips`** sets the desired state to *attached*, then runs `attach` and `announce` for each VIP. If any attach fails, it reports `AttachFailed`; the machine then emits `DetachVips`, unless the network check run at once finds the network down (§11.2); then it is only logged.
   - Each attach request carries a number, one higher for every `AttachVips`, and `AttachFailed` carries the number of the attach that failed. The runtime passes the failure to the machine only if it belongs to the newest attach. An older one belongs to a master term the node has since left, and the attach queued after it may still succeed, so it must not fault the current term.
   - On Linux, `announce` sends the first burst of gratuitous ARPs.
 - **`DetachVips`** sets the desired state to *detached* and runs `detach` for each VIP.
   - If detach fails, it retries every 2 s, logging an error each time, until it succeeds or the desired state changes.
 - **`Announce`** runs `announce` for each VIP only if the desired state is *attached*.
+- **Verification.** While the VIPs are wanted, from an attach until a detach, the worker checks every 5 advert intervals (5 s by default) that they are there, by running `ensure_attached` for each VIP; after a failed attach that the runtime ignored because the network was down (§11.2), this tries the attach again, in case the network returns before the network check notices.
+  - A VIP that something else removed, such as NetworkManager clearing an interface, or an operator, is added back with the warning "the VIP was removed outside vipd; added it back". Then every VIP is announced again. A VIP added by a verification that retries a failed attach or verification is logged as "VIP attached on retry" instead, at info level.
+  - If a VIP cannot be checked or added back on two verifications in a row, the worker reports `AttachFailed` with the number of the attach that made the VIPs wanted. One failure may be a passing glitch, and on Windows the verification runs netsh about 17,000 times a day. A failed attach counts as the first failure, so a retry that fails after it is reported at once. The runtime handles the report as a failed attach (§5.5): the node goes to Fault with the hold-down, and the peer takes over, unless the network check run at once finds the network down (§11.2); then it is only logged.
+  - A verification that falls due while an attach or detach request is waiting is skipped, because that request decides whether the VIPs are wanted; otherwise it could put back and announce a VIP that a waiting detach is about to remove.
 - **Coalescing.** Before it runs an attach, detach or announce request, the worker takes every request already waiting. If a later attach or detach is among them, it skips the current one: that later request supersedes an attach or detach, and makes an announce moot. So a backend slower than the election (Windows' 3 s duplicate-address check, or slow overrides) does not replay a backlog of past terms, which would leave the VIP trailing the election by seconds and make a stop wait for the whole backlog. The shutdown flush (§11.4) is never skipped.
 
 ### 11.4 Shutdown
@@ -506,7 +522,7 @@ On Linux, the `service` subcommands print an error that points to `packaging/vip
 |---|---|
 | A packet is malformed, forged, from the wrong group or replayed | Dropped, with a rate-limited warning. Never a crash. |
 | A VIP command hangs | Killed after 10 s and counted as a failure |
-| Attach fails | The machine goes to Fault with a 10 s hold-down, and stops preempting until it next becomes master on its own or restarts (§5.5) |
+| Attach fails, or two verifications in a row cannot check or add back a VIP (§11.3) | The machine goes to Fault with a 10 s hold-down, and stops preempting until it next becomes master on its own or restarts (§5.5), unless the network check run at once finds the network down (§11.2); then it is only logged |
 | Detach fails | Retried every 2 s, with loud errors, until it succeeds (§11.3) |
 | The process panics or crashes, or the VIP worker dies (§11.2) | systemd or the SCM restarts it, and the start-up cleanup (§11.1 step 3) removes any leftover VIP |
 | A stop cannot remove the VIPs within 15 s | Logged, and exit code 1 (§11.4); the Windows service still reports 0. The VIP may still be attached, and nothing restarts vipd after a requested stop. |
@@ -529,6 +545,7 @@ On Linux, the `service` subcommands print an error that points to `packaging/vip
 11. `check-config` rejects an adapter index given as `interface`, and accepts the adapter's name.
 12. Closing the console window of a foreground `vipd.exe run` leaves the VIP until vipd starts again, and start-up then removes it.
 13. The install steps from the README work: `icacls` leaves the config readable only by SYSTEM and Administrators, and the service starts from `C:\Program Files\vipd`.
+14. Turning Wi-Fi off makes the adapter's link go down while Windows keeps its address, so the node goes to Fault; turning it back on lets it rejoin, and a node with the highest priority takes the VIP back. The bind-address check alone did not notice this on real hardware: with Wi-Fi off four times, the longest for 3 minutes, Windows kept the adapter's DHCP address, and the node stayed master throughout.
 
 ## 16. Testing
 
